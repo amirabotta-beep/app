@@ -287,6 +287,27 @@ def download_java_sync():
         return False, "\n".join(steps), time.time() - start
 
 
+def verify_jar_file(path):
+    """
+    يتحقق إن ملف الـ jar موجود وسليم (zip صحيح) قبل ما نشغّله بالجافا.
+    بيكشف حالة الملف التالف بسبب رفع خاطئ على GitHub بدل ما ننتظر خطأ
+    'Invalid or corrupt jarfile' الغامض من الجافا.
+    """
+    name = os.path.basename(path)
+    if not os.path.isfile(path):
+        return False, f"❌ ملف {name} غير موجود في tools/."
+    size = os.path.getsize(path)
+    if size == 0:
+        return False, f"❌ ملف {name} موجود لكن حجمه صفر بايت (ملف فاضي/مقطوع)."
+    if not zipfile.is_zipfile(path):
+        return False, (
+            f"❌ ملف {name} تالف أو مش jar صحيح (حجمه الحالي {size/1024:.0f} كيلوبايت).\n"
+            "في الأغلب اتلف وقت الرفع على GitHub (مشكلة binary/line-endings).\n"
+            "الحل: ضيف .gitattributes واعمل git rm --cached + إعادة رفع الملف."
+        )
+    return True, f"✅ {name} سليم ({size/1024:.0f} كيلوبايت)."
+
+
 async def check_java_flow(query):
     """زرار 'فحص/تحميل Java': يتحقق الأول، ولو مش موجودة ينزلها مع تيمر حي."""
     global JAVA_BIN
@@ -542,8 +563,9 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if name.endswith(".apk"):
-        if not os.path.isfile(APKTOOL_JAR):
-            await update.message.reply_text(f"❌ apktool.jar غير موجود في:\n{APKTOOL_JAR}\nضيفه هناك وحاول تاني.")
+        ok_jar, jar_msg = verify_jar_file(APKTOOL_JAR)
+        if not ok_jar:
+            await update.message.reply_text(jar_msg)
             return
 
         # ── احفظ الاسم الأصلي للملف عشان نستخدمه في GitHub Release ──
@@ -699,8 +721,13 @@ async def do_build_and_sign(context, chat_id, status_msg, uid, mode, ks_name=Non
     if not os.path.isdir(PROJECT_DIR):
         await status_msg.edit_text("❌ لا يوجد مشروع مفكوك حالياً.")
         return
-    if not os.path.isfile(UBER_SIGNER_JAR):
-        await status_msg.edit_text(f"❌ uber-apk-signer.jar غير موجود في:\n{UBER_SIGNER_JAR}")
+    ok_jar, jar_msg = verify_jar_file(APKTOOL_JAR)
+    if not ok_jar:
+        await status_msg.edit_text(jar_msg)
+        return
+    ok_jar, jar_msg = verify_jar_file(UBER_SIGNER_JAR)
+    if not ok_jar:
+        await status_msg.edit_text(jar_msg)
         return
 
     unsigned_apk = os.path.join(WORKSPACE_DIR, "unsigned_" + random_string(6) + ".apk")
@@ -870,8 +897,9 @@ async def start_build_flow(query, uid):
     if not os.path.isdir(PROJECT_DIR):
         await query.edit_message_text("❌ لا يوجد مشروع مفكوك حالياً. ابعت ملف APK أولاً.", reply_markup=main_menu_kb())
         return
-    if not os.path.isfile(UBER_SIGNER_JAR):
-        await query.edit_message_text(f"❌ uber-apk-signer.jar غير موجود في:\n{UBER_SIGNER_JAR}")
+    ok_jar, jar_msg = verify_jar_file(UBER_SIGNER_JAR)
+    if not ok_jar:
+        await query.edit_message_text(jar_msg, reply_markup=main_menu_kb())
         return
     kb = [
         [InlineKeyboardButton("🎲 توقيع عشوائي", callback_data="sign_random")],
@@ -1374,8 +1402,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not apk_path or not os.path.isfile(apk_path):
             await query.edit_message_text("❌ الملف مش موجود.", reply_markup=main_menu_kb())
             return
-        if not os.path.isfile(APKTOOL_JAR):
-            await query.edit_message_text(f"❌ apktool.jar غير موجود في:\n{APKTOOL_JAR}", reply_markup=main_menu_kb())
+        ok_jar, jar_msg = verify_jar_file(APKTOOL_JAR)
+        if not ok_jar:
+            await query.edit_message_text(jar_msg, reply_markup=main_menu_kb())
             return
         # انسخ الملف لمسار الـ APK الأساسي وافكه
         shutil.copy2(apk_path, APK_COPY_PATH)
