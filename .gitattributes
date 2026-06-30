@@ -1,0 +1,5 @@
+*.jar binary -diff -merge
+*.zip binary -diff -merge
+*.apk binary -diff -merge
+*.keystore binary -diff -merge
+*.jks binary -diff -merge
