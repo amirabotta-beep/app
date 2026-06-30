@@ -2,4 +2,15 @@
 providers = ["python"]
 
 [phases.setup]
-aptPkgs = ["default-jre"]
+# نزّل JRE خفيفة (Eclipse Temurin 17) وقت الـ build بدل رفعها في الريبو
+cmds = [
+  "mkdir -p tools",
+  "curl -L -o /tmp/jre.tar.gz https://api.adoptium.net/v3/binary/latest/17/ga/linux/x64/jre/hotspot/normal/eclipse",
+  "tar -xzf /tmp/jre.tar.gz -C /tmp",
+  "mv /tmp/jdk-17*-jre tools/jre",
+  "rm -f /tmp/jre.tar.gz",
+  "tools/jre/bin/java -version"
+]
+
+[phases.build]
+cmds = ["echo 'تم تجهيز الجافا بنجاح'"]
