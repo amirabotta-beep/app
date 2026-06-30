@@ -1,0 +1,5 @@
+[providers]
+providers = ["python"]
+
+[phases.setup]
+aptPkgs = ["default-jre"]
