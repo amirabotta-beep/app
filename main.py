@@ -176,7 +176,18 @@ async def run_cmd(cmd):
                 text=True,
                 timeout=1800,
             )
-            return proc.returncode == 0, proc.stdout or ""
+            out = proc.stdout or ""
+            if proc.returncode == 0:
+                return True, out
+            if proc.returncode < 0:
+                # العملية اتقفلت بإشارة (signal) من السيستم نفسه — الأشهر -9 = SIGKILL بسبب نفاذ الذاكرة (OOM)
+                sig = -proc.returncode
+                note = (
+                    f"\n\n⚠️ العملية اتقفلت بالقوة بإشارة رقم {sig}"
+                    + (" (SIGKILL — الأرجح نفاذ الذاكرة RAM على السيرفر / Out of Memory)." if sig == 9 else ".")
+                )
+                return False, out + note
+            return False, out + f"\n\n⚠️ رمز الخروج (exit code): {proc.returncode}"
         except FileNotFoundError:
             return False, "❌ تعذر تشغيل الأمر. تأكد أن Java مثبت بشكل صحيح على السيرفر."
         except subprocess.TimeoutExpired:
@@ -725,7 +736,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text("✅ تم فك الـ APK بنجاح.\n" + tail_log(log_text))
             await update.message.reply_text("📋 القائمة الرئيسية:", reply_markup=main_menu_kb())
         else:
-            await msg.edit_text("❌ فشلت عملية الفك:\n" + tail_log(log_text), reply_markup=main_menu_kb())
+            await msg.edit_text("❌ فشلت عملية الفك:\n" + tail_log(log_text, 1500), reply_markup=main_menu_kb())
         return
 
     await update.message.reply_text(
@@ -1564,7 +1575,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text("✅ تم فك الـ APK بنجاح.\n" + tail_log(log_text))
             await context.bot.send_message(query.message.chat_id, "📋 القائمة الرئيسية:", reply_markup=main_menu_kb())
         else:
-            await msg.edit_text("❌ فشلت عملية الفك:\n" + tail_log(log_text), reply_markup=main_menu_kb())
+            await msg.edit_text("❌ فشلت عملية الفك:\n" + tail_log(log_text, 1500), reply_markup=main_menu_kb())
 
     # ── حذف / ريستارت ──
     elif data == "menu_delete_project":
