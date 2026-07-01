@@ -72,20 +72,24 @@ JAVA_BIN = _LOCAL_JAVA_BIN if os.path.isfile(_LOCAL_JAVA_BIN) else "java"
 print(f"☕ Java path: {JAVA_BIN}  (محلي: {os.path.isfile(_LOCAL_JAVA_BIN)})")
 
 # ── إعدادات ذاكرة الجافا: مضبوطة لسيرفر 1GB RAM / 2 vCPU (Railway) ──
-# بما إن عملية جافا واحدة بس بتشتغل في نفس الوقت (فك أو تجميع أو توقيع، مش
-# مع بعض - في قفل "busy" بيمنع التداخل)، أقصى استهلاك متوقع هو الـ heap ده
-# + overhead البايثون نفسه (~100-150MB) + حاجة بسيطة للنظام، فمسموح نزود
-# الـ heap شوية عن 640m السابقة عشان نقلل GC pauses ونسرّع التجميع.
-# لو رجعت مشكلة الـ OOM (كراش كامل للسيرفر)، رجّع Xmx لـ 640m أو أقل.
+# ملحوظة مهمة: لو المشروع كبير (multidex بعدد كبير من classesN.dex)، تشغيل
+# apktool بأكتر من thread (jobs) بيخلي عدة ملفات dex تتبني في نفس اللحظة،
+# وكل thread بياخد نصيبه من الرام بالتوازي - وده بيضاعف الذروة القصوى
+# للاستهلاك ويسبب SIGKILL (OOM) بسهولة على سيرفر 1GB. فبالنسبة للتطبيقات
+# الكبيرة، الاستقرار (jobs=1 وقت البناء) أهم من كسب ثواني قليلة بالتوازي.
 JAVA_MEM_OPTS = [
-    "-Xms256m",                    # heap ابتدائي أكبر يقلل إعادة التحجيم أثناء التشغيل
-    "-Xmx800m",                    # سقف أعلى شوية من قبل (كان 640m) لتقليل الـ GC pauses
-    "-XX:+UseParallelGC",          # جامع قمامة بيستفيد من الـ 2 vCPU المتاحين (أسرع من Serial هنا)
-    "-XX:ParallelGCThreads=2",
-    "-XX:MaxMetaspaceSize=160m",   # سقف واضح للـ metaspace عشان ميكبرش من غير حدود
+    "-Xms192m",
+    "-Xmx640m",                    # سقف محافظ يسيب مساحة كافية لـ overhead التوازي/الـ native buffers
+    "-XX:+UseSerialGC",            # أقل استهلاك رام إضافي مقارنة بـ Parallel/G1 (أهم من سرعة الـ GC هنا)
+    "-XX:MaxMetaspaceSize=128m",
 ]
-# عدد الـ threads اللي apktool يستخدمها = عدد الـ vCPU الفعلي المتاح (بدل ما يكون رقم ثابت)
-APKTOOL_JOBS = str(max(1, min(os.cpu_count() or 2, 2)))
+# عدد الـ threads وقت الفك (أخف بكتير بسبب فلاج -r اللي بيتخطى فك الموارد)
+APKTOOL_JOBS_DECOMPILE = str(max(1, min(os.cpu_count() or 2, 2)))
+# عدد الـ threads وقت التجميع (build): job واحد بس، لأن بناء أكتر من dex
+# بالتوازي هو اللي بيسبب الـ OOM في التطبيقات الكبيرة (multidex)
+APKTOOL_JOBS_BUILD = "1"
+# إبقاء الاسم القديم شغال في أي استخدام قديم متبقي (لو فيه) = وضع الفك
+APKTOOL_JOBS = APKTOOL_JOBS_DECOMPILE
 
 for _d in (TOOLS_DIR, WORKSPACE_DIR, KEYSTORES_DIR):
     os.makedirs(_d, exist_ok=True)
@@ -951,7 +955,7 @@ async def do_build_and_sign(context, chat_id, status_msg, uid, mode, ks_name=Non
 
     await status_msg.edit_text("⏳ 1) جاري تجميع المشروع (apktool build)...")
     ok, log_text = await run_cmd_with_heartbeat(
-        [JAVA_BIN, *JAVA_MEM_OPTS, "-jar", APKTOOL_JAR, "b", PROJECT_DIR, "-o", unsigned_apk, "-j", APKTOOL_JOBS],
+        [JAVA_BIN, *JAVA_MEM_OPTS, "-jar", APKTOOL_JAR, "b", PROJECT_DIR, "-o", unsigned_apk, "-j", APKTOOL_JOBS_BUILD],
         status_msg, "⏳ 1) جاري تجميع المشروع (apktool build)...",
     )
     if not ok or not os.path.isfile(unsigned_apk):
