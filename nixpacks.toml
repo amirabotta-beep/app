@@ -1,2 +1,32 @@
 [providers]
 providers = ["python"]
+
+[phases.setup]
+cmds = [
+  "mkdir -p tools",
+
+  # ── 1) JRE خفيفة (بدل تثبيت جافا كاملة عبر apt) ──
+  "curl -L -o /tmp/jre.tar.gz https://api.adoptium.net/v3/binary/latest/17/ga/linux/x64/jre/hotspot/normal/eclipse",
+  "tar -xzf /tmp/jre.tar.gz -C /tmp",
+  "mv /tmp/jdk-17*-jre tools/jre",
+  "rm -f /tmp/jre.tar.gz",
+
+  # ── 2) apktool.jar : أحدث إصدار مباشرة من GitHub Releases (احتياطي/فحص المشروع) ──
+  "curl -sL https://api.github.com/repos/iBotPeaches/Apktool/releases/latest | grep -o 'https://[^\"]*apktool_[^\"]*\\.jar' | head -1 | xargs -I{} curl -L -o tools/apktool.jar {}",
+
+  # ── 3) uber-apk-signer.jar : أحدث إصدار مباشرة من GitHub Releases ──
+  "curl -sL https://api.github.com/repos/patrickfav/uber-apk-signer/releases/latest | grep -o 'https://[^\"]*uber-apk-signer-[^\"]*\\.jar' | head -1 | xargs -I{} curl -L -o tools/uber-apk-signer.jar {}",
+
+  # ── 4) baksmali.jar : فك ملفات dex لـ smali فقط (خفيف جدًا، بدون فك موارد/صور) ──
+  "curl -sL https://api.github.com/repos/baksmali/smali/releases/latest | grep -o 'https://[^\"]*baksmali-[0-9][^\"]*-fat\\.jar' | head -1 | xargs -I{} curl -L -o tools/baksmali.jar {}",
+
+  # ── 5) smali.jar : تجميع مجلدات smali لملف dex تاني ──
+  "curl -sL https://api.github.com/repos/baksmali/smali/releases/latest | grep -o 'https://[^\"]*/smali-[0-9][^\"]*-fat\\.jar' | head -1 | xargs -I{} curl -L -o tools/smali.jar {}",
+
+  # ── تحقق نهائي: اطبع الأحجام في لوج الـ build عشان تتأكد إنهم اتحملوا صح ──
+  "ls -la tools/",
+  "tools/jre/bin/java -version"
+]
+
+[phases.build]
+cmds = ["echo '✅ تم تجهيز الجافا وapktool وuber-apk-signer بنجاح'"]
