@@ -65,6 +65,8 @@ CONFIG_PATH     = os.path.join(BASE_DIR, "config.json")
 APKTOOL_JAR     = os.path.join(TOOLS_DIR, "apktool.jar")
 UBER_SIGNER_JAR = os.path.join(TOOLS_DIR, "uber-apk-signer.jar")
 CLASSES_ZIP_PATH= os.path.join(TOOLS_DIR, "classes.zip")
+BAKSMALI_JAR    = os.path.join(TOOLS_DIR, "baksmali.jar")
+SMALI_JAR       = os.path.join(TOOLS_DIR, "smali.jar")
 
 # ── جافا: استخدم النسخة المحمولة جوه tools/jre لو موجودة، وإلا ارجع لجافا السيرفر ──
 _LOCAL_JAVA_BIN = os.path.join(TOOLS_DIR, "jre", "bin", "java")
@@ -99,6 +101,17 @@ APKTOOL_JOBS_DECOMPILE = str(max(1, min(os.cpu_count() or 2, 2)))
 APKTOOL_JOBS_BUILD = "1"
 # إبقاء الاسم القديم شغال في أي استخدام قديم متبقي (لو فيه) = وضع الفك
 APKTOOL_JOBS = APKTOOL_JOBS_DECOMPILE
+
+# ── إعدادات ذاكرة baksmali/smali: أخف بكتير من apktool لأنها بتشتغل على ──
+# ملف dex واحد في كل مرة (مش الـ APK كله دفعة واحدة زي apktool)، ومفيش
+# فك/بناء موارد خالص. سقف ذاكرة أقل كفاية جدًا ومريح أكتر على سيرفر 1GB.
+SMALI_MEM_OPTS = [
+    "-Xmx384m",
+    "-XX:+UseSerialGC",
+]
+# عدد الـ threads بتاعة baksmali/smali (متعدد الخيوط افتراضيًا داخليًا)،
+# نثبته عند 2 عشان يتماشى مع الـ 2 vCPU المتاحة من غير تزاحم زيادة.
+SMALI_JOBS = str(max(1, min(os.cpu_count() or 2, 2)))
 
 for _d in (TOOLS_DIR, WORKSPACE_DIR, KEYSTORES_DIR):
     os.makedirs(_d, exist_ok=True)
@@ -493,6 +506,184 @@ def verify_jar_file(path):
     return True, f"✅ {name} سليم ({size/1024:.0f} كيلوبايت)."
 
 
+# =============================================================================
+# فك وتجميع سريع (baksmali/smali) بدل apktool الكامل
+# ─────────────────────────────────────────────────────────────────────────
+# apktool بيفك حاجتين مع بعض: الأكواد (dex → smali) والموارد (الصور/الألوان/
+# الـ manifest → XML قابل للتعديل). البوت مش بيلمس الموارد خالص (البحث
+# والاستبدال شغال على .smali بس)، فبنستخدم baksmali/smali اللي بتشتغل على
+# الأكواد فقط، وبنسيب الموارد والـ manifest والصور زي ما هي بالظبط جوه
+# نسخة من ملف الـ APK الأصلي (zip عادي). النتيجة: ذاكرة أقل بكتير، وسرعة أعلى.
+# =============================================================================
+
+def list_dex_entries_sync(apk_path):
+    """يرجع أسماء كل ملفات classesN.dex الموجودة جوه الـ APK بترتيبها."""
+    with zipfile.ZipFile(apk_path, "r") as zf:
+        names = [n for n in zf.namelist() if re.fullmatch(r"classes\d*\.dex", n)]
+    def sort_key(n):
+        m = re.fullmatch(r"classes(\d*)\.dex", n)
+        num = m.group(1)
+        return int(num) if num else 1
+    return sorted(names, key=sort_key)
+
+
+def dex_to_smali_folder_name(dex_name):
+    """classes.dex → smali | classes2.dex → smali_classes2"""
+    m = re.fullmatch(r"classes(\d*)\.dex", dex_name)
+    num = m.group(1)
+    return "smali" if not num else f"smali_classes{num}"
+
+
+def smali_folder_to_dex_name(folder_name):
+    """smali → classes.dex | smali_classes2 → classes2.dex"""
+    if folder_name == "smali":
+        return "classes.dex"
+    m = re.fullmatch(r"smali_classes(\d+)", folder_name)
+    return f"classes{m.group(1)}.dex" if m else None
+
+
+def decompile_apk_fast_sync(apk_path, project_dir):
+    """
+    فك سريع وخفيف: بيطلع كل classesN.dex ويحوّله smali بس (baksmali)،
+    من غير ما يلمس الموارد أو الـ manifest أو الصور خالص - بيفضلوا
+    محفوظين كنسخة كاملة من الـ APK الأصلي جوه project_dir/original.apk
+    عشان نستخدمها وقت التجميع تاني.
+    """
+    if os.path.isdir(project_dir):
+        shutil.rmtree(project_dir, ignore_errors=True)
+    os.makedirs(project_dir, exist_ok=True)
+
+    original_backup = os.path.join(project_dir, "original.apk")
+    shutil.copy2(apk_path, original_backup)
+
+    dex_entries = list_dex_entries_sync(apk_path)
+    if not dex_entries:
+        return False, "❌ مفيش أي ملف classes.dex جوه الـ APK ده."
+
+    tmp_dex_dir = os.path.join(project_dir, "_dex_tmp")
+    os.makedirs(tmp_dex_dir, exist_ok=True)
+    with zipfile.ZipFile(apk_path, "r") as zf:
+        for entry in dex_entries:
+            zf.extract(entry, tmp_dex_dir)
+
+    full_log = []
+    for entry in dex_entries:
+        dex_path = os.path.join(tmp_dex_dir, entry)
+        out_folder = os.path.join(project_dir, dex_to_smali_folder_name(entry))
+        proc = subprocess.run(
+            [JAVA_BIN, *SMALI_MEM_OPTS, "-jar", BAKSMALI_JAR, "d",
+             dex_path, "-o", out_folder, "-j", SMALI_JOBS],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=1800,
+        )
+        full_log.append(f"── {entry} ──\n" + (proc.stdout or ""))
+        if proc.returncode != 0:
+            shutil.rmtree(tmp_dex_dir, ignore_errors=True)
+            return False, "\n".join(full_log)
+
+    shutil.rmtree(tmp_dex_dir, ignore_errors=True)
+    return True, "\n".join(full_log)
+
+
+async def decompile_apk_fast(apk_path, project_dir, status_msg=None, base_text=""):
+    return await asyncio.to_thread(decompile_apk_fast_sync, apk_path, project_dir)
+
+
+def build_apk_fast_sync(project_dir, out_apk_path):
+    """
+    تجميع سريع: بيجمّع كل مجلد smali_classesX لملف dex تاني (smali)،
+    وبعدين بيحط الـ dex الجديد مكان القديم جوه نسخة من الـ APK الأصلي
+    (original.apk) - فالموارد والصور والـ manifest بتفضل زي ما هي
+    بالظبط من غير أي فك أو إعادة بناء ليهم.
+    """
+    original_backup = os.path.join(project_dir, "original.apk")
+    if not os.path.isfile(original_backup):
+        return False, "❌ مفقود original.apk (نسخة النسخ الاحتياطي من المشروع الأصلي)."
+
+    smali_folders = [
+        d for d in os.listdir(project_dir)
+        if os.path.isdir(os.path.join(project_dir, d))
+        and (d == "smali" or re.fullmatch(r"smali_classes\d+", d))
+    ]
+    if not smali_folders:
+        return False, "❌ مفيش أي مجلد smali جوه المشروع."
+
+    tmp_dex_dir = os.path.join(project_dir, "_dex_build_tmp")
+    if os.path.isdir(tmp_dex_dir):
+        shutil.rmtree(tmp_dex_dir, ignore_errors=True)
+    os.makedirs(tmp_dex_dir, exist_ok=True)
+
+    full_log = []
+    new_dex_paths = {}
+    for folder in smali_folders:
+        dex_name = smali_folder_to_dex_name(folder)
+        if not dex_name:
+            continue
+        folder_path = os.path.join(project_dir, folder)
+        dex_out = os.path.join(tmp_dex_dir, dex_name)
+        proc = subprocess.run(
+            [JAVA_BIN, *SMALI_MEM_OPTS, "-jar", SMALI_JAR, "assemble",
+             folder_path, "-o", dex_out, "-j", SMALI_JOBS],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=1800,
+        )
+        full_log.append(f"── {folder} → {dex_name} ──\n" + (proc.stdout or ""))
+        if proc.returncode != 0 or not os.path.isfile(dex_out):
+            shutil.rmtree(tmp_dex_dir, ignore_errors=True)
+            return False, "\n".join(full_log)
+        new_dex_paths[dex_name] = dex_out
+
+    try:
+        if os.path.isfile(out_apk_path):
+            os.remove(out_apk_path)
+        shutil.copy2(original_backup, out_apk_path)
+
+        # نستبدل كل ملف dex قديم بالنسخة الجديدة جوه نفس الـ APK (zip)، من
+        # غير ما نلمس أي entry تاني (موارد/صور/manifest بتفضل زي ما هي).
+        tmp_zip_path = out_apk_path + ".tmp"
+        with zipfile.ZipFile(out_apk_path, "r") as zin, \
+             zipfile.ZipFile(tmp_zip_path, "w", zipfile.ZIP_DEFLATED) as zout:
+            existing_names = set(zin.namelist())
+            for item in zin.infolist():
+                if item.filename in new_dex_paths:
+                    continue
+                zout.writestr(item, zin.read(item.filename))
+            for dex_name, dex_path in new_dex_paths.items():
+                with open(dex_path, "rb") as f:
+                    zout.writestr(dex_name, f.read())
+        os.replace(tmp_zip_path, out_apk_path)
+    except Exception as e:
+        shutil.rmtree(tmp_dex_dir, ignore_errors=True)
+        return False, "\n".join(full_log) + f"\n❌ خطأ أثناء إعادة تجميع الـ APK: {e}"
+
+    shutil.rmtree(tmp_dex_dir, ignore_errors=True)
+    full_log.append(f"✅ تم إنتاج {out_apk_path}")
+    return True, "\n".join(full_log)
+
+
+async def build_apk_fast(project_dir, out_apk_path):
+    return await asyncio.to_thread(build_apk_fast_sync, project_dir, out_apk_path)
+
+
+async def run_async_with_heartbeat(coro, status_msg, base_text, interval=5):
+    """
+    زي run_cmd_with_heartbeat، لكن لأي عملية async (مش بس subprocess) -
+    بنستخدمها مع decompile_apk_fast/build_apk_fast اللي بتلف على كذا
+    ملف dex بدل أمر واحد. بترجع (ok, log_text, elapsed_seconds).
+    """
+    start = time.time()
+    task = asyncio.ensure_future(coro)
+    while not task.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=interval)
+        except asyncio.TimeoutError:
+            elapsed = time.time() - start
+            try:
+                await status_msg.edit_text(f"{base_text}\n⏱ لسه شغال... ({int(elapsed)} ثانية)")
+            except Exception:
+                pass
+    ok, log_text = await task
+    return ok, log_text, time.time() - start
+
+
 async def check_java_flow(query):
     """زرار 'فحص/تحميل Java': يتحقق الأول، ولو مش موجودة ينزلها مع تيمر حي."""
     global JAVA_BIN
@@ -627,23 +818,85 @@ def download_tool_jar_sync(github_repo, name_contains, dest_path):
         return False, "\n".join(steps), time.time() - start
 
 
+def download_smali_tool_jar_sync(kind, dest_path):
+    """
+    تحميل baksmali.jar أو smali.jar من مستودع baksmali/smali الرسمي.
+    فلترة دقيقة بـ regex (مش 'in' البسيطة) عشان أسماء الملفات متشابهة
+    جدًا (مثلاً smali-baksmali-x.y.z-javadoc.jar) ومينفعش نغلط في الاختيار.
+    kind: 'baksmali' أو 'smali'
+    """
+    start = time.time()
+    steps = []
+
+    def log(msg):
+        elapsed = time.time() - start
+        steps.append(f"[{elapsed:5.1f}s] {msg}")
+
+    tmp_path = dest_path + ".part"
+    pattern = re.compile(rf"^{kind}-[\d.]+-fat\.jar$")
+
+    try:
+        log(f"🔎 جاري البحث عن أحدث إصدار {kind} في baksmali/smali...")
+        api_url = "https://api.github.com/repos/baksmali/smali/releases/latest"
+        r = requests.get(api_url, timeout=30, headers={"Accept": "application/vnd.github+json"})
+        r.raise_for_status()
+        assets = r.json().get("assets", [])
+
+        jar_asset = next((a for a in assets if pattern.match(a.get("name", ""))), None)
+        if not jar_asset:
+            log(f"❌ مفيش ملف {kind}-X.Y.Z-fat.jar مطابق في آخر إصدار على GitHub")
+            return False, "\n".join(steps), time.time() - start
+
+        log(f"✅ لقيت: {jar_asset['name']}")
+        log("⬇️ جاري التحميل...")
+        with requests.get(jar_asset["browser_download_url"], stream=True, timeout=120, allow_redirects=True) as resp:
+            resp.raise_for_status()
+            with open(tmp_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+
+        size_mb = os.path.getsize(tmp_path) / 1024 / 1024
+        log(f"✅ اكتمل التحميل ({size_mb:.1f} ميجا)")
+
+        if not zipfile.is_zipfile(tmp_path):
+            log("❌ الملف اتحمّل لكنه مش jar/zip صحيح (فشل التحقق)")
+            os.remove(tmp_path)
+            return False, "\n".join(steps), time.time() - start
+
+        shutil.move(tmp_path, dest_path)
+        log(f"✅ تم الحفظ في {dest_path}")
+        return True, "\n".join(steps), time.time() - start
+
+    except Exception as e:
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        log(f"❌ خطأ: {e}")
+        return False, "\n".join(steps), time.time() - start
+
+
 async def check_tools_flow(query):
-    """زرار 'فحص/تحميل أدوات APK': يتحقق من apktool.jar وuber-apk-signer.jar، وينزل الناقص/التالف منهم."""
-    msg = await query.edit_message_text("⏳ جاري التحقق من apktool.jar وuber-apk-signer.jar...")
+    """زرار 'فحص/تحميل أدوات APK': يتحقق من كل الأدوات المطلوبة، وينزل الناقص/التالف منهم."""
+    msg = await query.edit_message_text("⏳ جاري التحقق من الأدوات (apktool, uber-apk-signer, baksmali, smali)...")
 
     ok1, msg1 = verify_jar_file(APKTOOL_JAR)
     ok2, msg2 = verify_jar_file(UBER_SIGNER_JAR)
+    ok3, msg3 = verify_jar_file(BAKSMALI_JAR)
+    ok4, msg4 = verify_jar_file(SMALI_JAR)
 
-    if ok1 and ok2:
+    if ok1 and ok2 and ok3 and ok4:
         await msg.edit_text(
-            "✅ كل الأدوات موجودة وسليمة!\n\n" + f"{msg1}\n{msg2}",
+            "✅ كل الأدوات موجودة وسليمة!\n\n" + f"{msg1}\n{msg2}\n{msg3}\n{msg4}",
             reply_markup=main_menu_kb(),
         )
         return
 
     await msg.edit_text(
         "⚠️ فيه أداة ناقصة أو تالفة:\n\n"
-        f"{msg1}\n{msg2}\n\n"
+        f"{msg1}\n{msg2}\n{msg3}\n{msg4}\n\n"
         "⏳ جاري تحميل الأداة/الأدوات الناقصة من GitHub Releases (مش من رفعك اليدوي)..."
     )
 
@@ -680,6 +933,12 @@ async def check_tools_flow(query):
             download_tool_jar_sync, "patrickfav/uber-apk-signer", "uber-apk-signer-", UBER_SIGNER_JAR
         )
         full_log.append("📦 uber-apk-signer.jar:\n" + log_text)
+    if not ok3:
+        s, log_text, _ = await asyncio.to_thread(download_smali_tool_jar_sync, "baksmali", BAKSMALI_JAR)
+        full_log.append("📦 baksmali.jar:\n" + log_text)
+    if not ok4:
+        s, log_text, _ = await asyncio.to_thread(download_smali_tool_jar_sync, "smali", SMALI_JAR)
+        full_log.append("📦 smali.jar:\n" + log_text)
 
     stop_timer.set()
     try:
@@ -691,12 +950,14 @@ async def check_tools_flow(query):
 
     ok1f, msg1f = verify_jar_file(APKTOOL_JAR)
     ok2f, msg2f = verify_jar_file(UBER_SIGNER_JAR)
-    header = "✅ تم تجهيز كل الأدوات بنجاح!" if (ok1f and ok2f) else "❌ لسه فيه مشكلة في تجهيز الأدوات."
+    ok3f, msg3f = verify_jar_file(BAKSMALI_JAR)
+    ok4f, msg4f = verify_jar_file(SMALI_JAR)
+    header = "✅ تم تجهيز كل الأدوات بنجاح!" if (ok1f and ok2f and ok3f and ok4f) else "❌ لسه فيه مشكلة في تجهيز الأدوات."
 
     await msg.edit_text(
         f"{header}\n\n"
         f"⏱ المدة الكلية: {total_elapsed:.1f} ثانية\n\n"
-        f"{msg1f}\n{msg2f}\n\n"
+        f"{msg1f}\n{msg2f}\n{msg3f}\n{msg4f}\n\n"
         f"📋 سجل التيمر (ابعتهولي لو فيه مشكلة):\n{tail_log(chr(10).join(full_log), 900)}",
         reply_markup=main_menu_kb(),
     )
@@ -905,14 +1166,14 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if os.path.isdir(PROJECT_DIR):
             shutil.rmtree(PROJECT_DIR, ignore_errors=True)
 
-        await msg.edit_text("⏳ جاري فك الـ APK (apktool)...")
+        await msg.edit_text("⏳ جاري فك الـ APK (baksmali - أكواد فقط)...")
         apk_size = os.path.getsize(APK_COPY_PATH)
-        est = estimate_seconds("decompile", apk_size)
-        ok, log_text, elapsed = await run_cmd_with_heartbeat(
-            [JAVA_BIN, *JAVA_MEM_OPTS, "-jar", APKTOOL_JAR, "d", APK_COPY_PATH, "-o", PROJECT_DIR, "-f", "-r", "-j", APKTOOL_JOBS],
-            msg, "⏳ جاري فك الـ APK (apktool)...",
-            estimated_seconds=est, stage="decompile", size_bytes=apk_size,
+        ok, log_text, elapsed = await run_async_with_heartbeat(
+            decompile_apk_fast(APK_COPY_PATH, PROJECT_DIR),
+            msg, "⏳ جاري فك الـ APK (baksmali - أكواد فقط)...",
         )
+        if ok:
+            record_stage_time("decompile", apk_size, elapsed)
 
         if ok:
             await msg.edit_text(f"✅ تم فك الـ APK بنجاح في {format_duration(elapsed)}.\n" + tail_log(log_text))
@@ -1059,7 +1320,7 @@ async def do_build_and_sign(context, chat_id, status_msg, uid, mode, ks_name=Non
     if problems:
         await status_msg.edit_text(project_integrity_report_text(problems), reply_markup=main_menu_kb())
         return
-    ok_jar, jar_msg = verify_jar_file(APKTOOL_JAR)
+    ok_jar, jar_msg = verify_jar_file(SMALI_JAR)
     if not ok_jar:
         await status_msg.edit_text(jar_msg)
         return
@@ -1076,13 +1337,13 @@ async def do_build_and_sign(context, chat_id, status_msg, uid, mode, ks_name=Non
         shutil.rmtree(dist_dir, ignore_errors=True)
 
     project_size = get_dir_size(PROJECT_DIR)
-    est_build = estimate_seconds("build", project_size)
-    await status_msg.edit_text("⏳ 1) جاري تجميع المشروع (apktool build)...")
-    ok, log_text, build_elapsed = await run_cmd_with_heartbeat(
-        [JAVA_BIN, *JAVA_MEM_OPTS, "-jar", APKTOOL_JAR, "b", PROJECT_DIR, "-o", unsigned_apk, "-j", APKTOOL_JOBS_BUILD],
-        status_msg, "⏳ 1) جاري تجميع المشروع (apktool build)...",
-        estimated_seconds=est_build, stage="build", size_bytes=project_size,
+    await status_msg.edit_text("⏳ 1) جاري تجميع المشروع (smali - أكواد فقط)...")
+    ok, log_text, build_elapsed = await run_async_with_heartbeat(
+        build_apk_fast(PROJECT_DIR, unsigned_apk),
+        status_msg, "⏳ 1) جاري تجميع المشروع (smali - أكواد فقط)...",
     )
+    if ok:
+        record_stage_time("build", project_size, build_elapsed)
     if not ok or not os.path.isfile(unsigned_apk):
         await status_msg.edit_text("❌ فشل التجميع:\n" + tail_log(log_text), reply_markup=main_menu_kb())
         return
@@ -1841,7 +2102,7 @@ async def _handle_callback(query, context, uid, data, st):
         if not apk_path or not os.path.isfile(apk_path):
             await query.edit_message_text("❌ الملف مش موجود.", reply_markup=main_menu_kb())
             return
-        ok_jar, jar_msg = verify_jar_file(APKTOOL_JAR)
+        ok_jar, jar_msg = verify_jar_file(BAKSMALI_JAR)
         if not ok_jar:
             await query.edit_message_text(jar_msg, reply_markup=main_menu_kb())
             return
@@ -1849,14 +2110,14 @@ async def _handle_callback(query, context, uid, data, st):
         shutil.copy2(apk_path, APK_COPY_PATH)
         if os.path.isdir(PROJECT_DIR):
             shutil.rmtree(PROJECT_DIR, ignore_errors=True)
-        msg = await query.edit_message_text("⏳ جاري فك الـ APK (apktool)...")
+        msg = await query.edit_message_text("⏳ جاري فك الـ APK (baksmali - أكواد فقط)...")
         apk_size = os.path.getsize(APK_COPY_PATH)
-        est = estimate_seconds("decompile", apk_size)
-        ok, log_text, elapsed = await run_cmd_with_heartbeat(
-            [JAVA_BIN, *JAVA_MEM_OPTS, "-jar", APKTOOL_JAR, "d", APK_COPY_PATH, "-o", PROJECT_DIR, "-f", "-r", "-j", APKTOOL_JOBS],
-            msg, "⏳ جاري فك الـ APK (apktool)...",
-            estimated_seconds=est, stage="decompile", size_bytes=apk_size,
+        ok, log_text, elapsed = await run_async_with_heartbeat(
+            decompile_apk_fast(APK_COPY_PATH, PROJECT_DIR),
+            msg, "⏳ جاري فك الـ APK (baksmali - أكواد فقط)...",
         )
+        if ok:
+            record_stage_time("decompile", apk_size, elapsed)
         try:
             os.remove(apk_path)
         except Exception:
