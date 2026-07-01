@@ -379,6 +379,144 @@ async def check_java_flow(query):
         )
 
 
+# =============================================================================
+# فحص وتحميل أدوات APK (apktool.jar + uber-apk-signer.jar)
+# نفس فكرة زرار الجافا: تحقق أول، ولو ناقص/تالف نزّله من GitHub Releases مباشرة
+# =============================================================================
+def download_tool_jar_sync(github_repo, name_contains, dest_path):
+    """
+    يجيب أحدث إصدار jar من GitHub Releases لمشروع معين ويحفظه في dest_path.
+    يرجع (success, log_text, elapsed_seconds) بنفس منطق التيمر بتاع الجافا.
+    """
+    start = time.time()
+    steps = []
+
+    def log(msg):
+        elapsed = time.time() - start
+        steps.append(f"[{elapsed:5.1f}s] {msg}")
+
+    tmp_path = dest_path + ".part"
+    try:
+        log(f"🔎 جاري البحث عن أحدث إصدار في {github_repo}...")
+        api_url = f"https://api.github.com/repos/{github_repo}/releases/latest"
+        r = requests.get(api_url, timeout=30, headers={"Accept": "application/vnd.github+json"})
+        r.raise_for_status()
+        assets = r.json().get("assets", [])
+
+        jar_asset = next(
+            (a for a in assets if a.get("name", "").endswith(".jar") and name_contains in a.get("name", "")),
+            None,
+        )
+        if not jar_asset:
+            log("❌ مفيش ملف jar مطابق في آخر إصدار على GitHub")
+            return False, "\n".join(steps), time.time() - start
+
+        log(f"✅ لقيت: {jar_asset['name']}")
+        log("⬇️ جاري التحميل...")
+        with requests.get(jar_asset["browser_download_url"], stream=True, timeout=120, allow_redirects=True) as resp:
+            resp.raise_for_status()
+            with open(tmp_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+
+        size_mb = os.path.getsize(tmp_path) / 1024 / 1024
+        log(f"✅ اكتمل التحميل ({size_mb:.1f} ميجا)")
+
+        if not zipfile.is_zipfile(tmp_path):
+            log("❌ الملف اتحمّل لكنه مش jar/zip صحيح (فشل التحقق)")
+            os.remove(tmp_path)
+            return False, "\n".join(steps), time.time() - start
+
+        shutil.move(tmp_path, dest_path)
+        log(f"✅ تم الحفظ في {dest_path}")
+        return True, "\n".join(steps), time.time() - start
+
+    except Exception as e:
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        log(f"❌ خطأ: {e}")
+        return False, "\n".join(steps), time.time() - start
+
+
+async def check_tools_flow(query):
+    """زرار 'فحص/تحميل أدوات APK': يتحقق من apktool.jar وuber-apk-signer.jar، وينزل الناقص/التالف منهم."""
+    msg = await query.edit_message_text("⏳ جاري التحقق من apktool.jar وuber-apk-signer.jar...")
+
+    ok1, msg1 = verify_jar_file(APKTOOL_JAR)
+    ok2, msg2 = verify_jar_file(UBER_SIGNER_JAR)
+
+    if ok1 and ok2:
+        await msg.edit_text(
+            "✅ كل الأدوات موجودة وسليمة!\n\n" + f"{msg1}\n{msg2}",
+            reply_markup=main_menu_kb(),
+        )
+        return
+
+    await msg.edit_text(
+        "⚠️ فيه أداة ناقصة أو تالفة:\n\n"
+        f"{msg1}\n{msg2}\n\n"
+        "⏳ جاري تحميل الأداة/الأدوات الناقصة من GitHub Releases (مش من رفعك اليدوي)..."
+    )
+
+    stop_timer = asyncio.Event()
+    start_time = time.time()
+
+    async def timer_loop():
+        while not stop_timer.is_set():
+            try:
+                await asyncio.wait_for(stop_timer.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
+            if stop_timer.is_set():
+                break
+            elapsed = int(time.time() - start_time)
+            try:
+                await msg.edit_text(
+                    "⏳ جاري تحميل الأدوات الناقصة...\n"
+                    f"⏱ التيمر: {elapsed} ثانية"
+                )
+            except Exception:
+                pass
+
+    timer_task = asyncio.create_task(timer_loop())
+
+    full_log = []
+    if not ok1:
+        s, log_text, _ = await asyncio.to_thread(
+            download_tool_jar_sync, "iBotPeaches/Apktool", "apktool_", APKTOOL_JAR
+        )
+        full_log.append("📦 apktool.jar:\n" + log_text)
+    if not ok2:
+        s, log_text, _ = await asyncio.to_thread(
+            download_tool_jar_sync, "patrickfav/uber-apk-signer", "uber-apk-signer-", UBER_SIGNER_JAR
+        )
+        full_log.append("📦 uber-apk-signer.jar:\n" + log_text)
+
+    stop_timer.set()
+    try:
+        await timer_task
+    except Exception:
+        pass
+
+    total_elapsed = time.time() - start_time
+
+    ok1f, msg1f = verify_jar_file(APKTOOL_JAR)
+    ok2f, msg2f = verify_jar_file(UBER_SIGNER_JAR)
+    header = "✅ تم تجهيز كل الأدوات بنجاح!" if (ok1f and ok2f) else "❌ لسه فيه مشكلة في تجهيز الأدوات."
+
+    await msg.edit_text(
+        f"{header}\n\n"
+        f"⏱ المدة الكلية: {total_elapsed:.1f} ثانية\n\n"
+        f"{msg1f}\n{msg2f}\n\n"
+        f"📋 سجل التيمر (ابعتهولي لو فيه مشكلة):\n{tail_log(chr(10).join(full_log), 900)}",
+        reply_markup=main_menu_kb(),
+    )
+
+
 async def send_long_text(context, chat_id, text):
     if len(text) <= 3500:
         await context.bot.send_message(chat_id=chat_id, text=text)
@@ -471,6 +609,7 @@ def main_menu_kb():
         [InlineKeyboardButton("📦 نقل classes.zip", callback_data="menu_classes")],
         [InlineKeyboardButton("🔑 إدارة شهادات التوقيع", callback_data="menu_keystores")],
         [InlineKeyboardButton("☕ فحص/تحميل Java", callback_data="menu_check_java")],
+        [InlineKeyboardButton("🛠 فحص/تحميل أدوات APK", callback_data="menu_check_tools")],
         [InlineKeyboardButton("🗑 حذف المشروع الحالي", callback_data="menu_delete_project")],
         [
             InlineKeyboardButton("♻️ إعادة ستارت", callback_data="menu_soft_restart"),
@@ -1357,6 +1496,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── فحص/تحميل Java ──
     elif data == "menu_check_java":
         await check_java_flow(query)
+
+    # ── فحص/تحميل أدوات APK ──
+    elif data == "menu_check_tools":
+        await check_tools_flow(query)
 
     # ── إدارة التوقيعات ──
     elif data == "menu_keystores":
