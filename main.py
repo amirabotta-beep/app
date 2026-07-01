@@ -145,7 +145,7 @@ DEFAULT_CONFIG = {
     "github_token"   : "",          # GitHub Personal Access Token (repo scope)
     "github_repo"    : "",          # مثال: "myuser/my-app"
     "github_key_path": "",          # مسار ملف .pem لو محتاجه (اختياري)
-    # release_counter محذوف — الرقم بييجي من GitHub مباشرةً
+    "release_counter": 0,           # عداد محلي لرقم الإصدار — بيزيد واحد بعد كل رفع ناجح
 }
 
 
@@ -199,33 +199,14 @@ def find_keystore(name):
 
 def get_next_release_version_from_github(token: str, repo: str) -> str:
     """
-    يجيب آخر release من GitHub ويزود رقمه 1.
-    لو مفيش releases خالص يبدأ من 1.
-    التاج بيتعمل برقم عادي بدون حرف v (1, 2, 3...) عشان يتماشى مع
-    التاجات القديمة الموجودة فعلاً على الريبو (كانت "1", "2" من غير v).
+    اسم الدالة اتسابت زي ما هي عشان مكانها في الكود، لكن دلوقتي
+    مبتسألش GitHub خالص — بتستخدم عداد محلي متخزّن في config.json
+    (release_counter). ده أسرع (مفيش استدعاء API إضافي)، وأثبت
+    (مش متأثر بحذف/تعديل releases قديمة على GitHub يدويًا).
+    الرقم بيتحفظ فعليًا في config.json بعد نجاح الرفع بس (في
+    github_upload_sync)، عشان لو الرفع فشل ميضيعش رقم من العداد.
     """
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept"       : "application/vnd.github.v3+json",
-    }
-    try:
-        r = requests.get(
-            f"https://api.github.com/repos/{repo}/releases/latest",
-            headers=headers,
-            timeout=15,
-        )
-        if r.status_code == 404:
-            # مفيش releases خالص
-            return "1"
-        r.raise_for_status()
-        tag = r.json().get("tag_name", "0")
-        # استخرج الرقم من الـ tag (بيشتغل مع "7" أو حتى "v7" القديمة لو لقاها)
-        m = re.search(r"(\d+)$", tag)
-        last_num = int(m.group(1)) if m else 0
-        return str(last_num + 1)
-    except Exception:
-        # لو فشل الاتصال، ارجع 1 كـ fallback
-        return "1"
+    return str(CFG.get("release_counter", 0) + 1)
 
 
 # =============================================================================
@@ -1042,6 +1023,12 @@ def github_upload_sync(apk_path: str, apk_original_name: str) -> tuple[bool, str
         return False, f"❌ فشل إنشاء الـ Release:\n{e}\n{r.text[:300]}"
     except Exception as e:
         return False, f"❌ خطأ في الاتصال بـ GitHub:\n{e}"
+
+    # الـ Release اتعمل بنجاح على GitHub بالفعل (التاج ده بقى مستخدم)،
+    # فلازم نحفظ العداد دلوقتي حتى لو رفع الملف نفسه فشل بعد كده — عشان
+    # المحاولة الجاية تاخد رقم جديد وميحصلش تعارض (tag already exists).
+    CFG["release_counter"] = int(tag_name)
+    save_config(CFG)
 
     upload_url  = release_data["upload_url"].split("{")[0]   # إزالة {?name,label}
     release_url = release_data["html_url"]
