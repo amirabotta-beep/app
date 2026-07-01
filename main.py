@@ -1413,6 +1413,7 @@ async def do_build_and_sign(context, chat_id, status_msg, uid, mode, ks_name=Non
         "📤 فين عايز ترفع الـ APK؟",
         reply_markup=upload_destination_kb(),
     )
+    st["active_upload_msg_id"] = status_msg.message_id
 
 
 async def deliver_signed_apk(context, chat_id, uid, destination: str):
@@ -1493,12 +1494,16 @@ async def deliver_signed_apk(context, chat_id, uid, destination: str):
             [InlineKeyboardButton("🐙 جرب GitHub بس",   callback_data="upload_github")],
             [InlineKeyboardButton("⬅️ رجوع",            callback_data="back_main")],
         ])
-        await context.bot.send_message(
+        sent = await context.bot.send_message(
             chat_id=chat_id,
             text=f"{summary}{cleanup_note}",
             reply_markup=retry_kb,
         )
+        # نحدّث الرسالة "الفعّالة" لآخر رسالة رفع ظهرت - أي زرار رفع من
+        # رسالة أقدم هيتم تجاهله تلقائيًا (الحماية اللي فوق في on_callback).
+        st["active_upload_msg_id"] = sent.message_id
     else:
+        st.pop("active_upload_msg_id", None)
         await context.bot.send_message(
             chat_id=chat_id,
             text=f"{summary}{cleanup_note}",
@@ -1981,6 +1986,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if is_heavy:
         st["busy"] = True
+
+    # ── حماية ضد ضغط زرار رفع (تيليجرام/GitHub/الاتنين) من رسالة قديمة ──
+    # كل مرة يحصل فشل في الرفع، بنبعت رسالة جديدة فيها 3 أزرار. لو فشلت
+    # أكتر من مرة، بيتكوّن كذا رسالة فيها أزرار بنفس الأسماء - فلو ضغط
+    # المستخدم زرار من رسالة قديمة، لازم نتجاهله بدل ما ننفذ أمر غلط
+    # (زي ما كان بيحصل: "GitHub بس" من رسالة قديمة كانت فعليًا "الاتنين").
+    UPLOAD_RELATED = {"upload_telegram", "upload_github", "upload_both"} 
+    is_upload_action = data in UPLOAD_RELATED or data.startswith("retry_upload_")
+    if is_upload_action:
+        active_msg_id = st.get("active_upload_msg_id")
+        if active_msg_id is not None and query.message.message_id != active_msg_id:
+            await query.answer(
+                "⚠️ الرسالة دي قديمة. استخدم آخر رسالة رفع ظهرت، أو رجّع من القائمة الرئيسية.",
+                show_alert=True,
+            )
+            return
 
     await query.answer()
 
