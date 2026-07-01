@@ -1510,9 +1510,14 @@ async def deliver_signed_apk(context, chat_id, uid, destination: str):
 def check_project_integrity(project_dir):
     """
     فحص سريع لسلامة المشروع المفكوك قبل محاولة التجميع، عشان لو المستخدم
-    عدّل/مسح حاجة يدوي جوه مجلد المشروع (زي حذف/تعديل smali أو الموارد)
-    نقدر نقوله بالظبط المشكلة فين على طول، بدل ما ننتظر apktool يفشل
+    عدّل/مسح حاجة يدوي جوه مجلد المشروع (زي حذف/تعديل smali)
+    نقدر نقوله بالظبط المشكلة فين على طول، بدل ما ننتظر smali يفشل
     بعد دقايق برسالة تقنية طويلة وغامضة.
+
+    ملحوظة: الفك بقى بطريقة baksmali (أكواد فقط)، فمفيش AndroidManifest.xml
+    ولا apktool.yml جوه المشروع خالص - الموارد والـ manifest متخزنين
+    كاملين جوه original.apk (نسخة من الـ APK الأصلي) وده اللي بنتأكد
+    من وجوده هنا بدلهم.
 
     بيرجّع list من رسائل المشاكل (فاضية = المشروع سليم ظاهريًا).
     """
@@ -1521,23 +1526,16 @@ def check_project_integrity(project_dir):
     if not os.path.isdir(project_dir):
         return ["❌ مجلد المشروع نفسه مش موجود."]
 
-    manifest_path = os.path.join(project_dir, "AndroidManifest.xml")
-    if not os.path.isfile(manifest_path):
-        problems.append("• ملف AndroidManifest.xml مش موجود في مجلد المشروع (تم حذفه أو نقله؟).")
-    elif os.path.getsize(manifest_path) == 0:
-        problems.append("• ملف AndroidManifest.xml موجود لكنه فاضي (0 بايت) - غالبًا اتمسح محتواه بالغلط.")
-    else:
-        # ملحوظة: الفك بيتم بفلاج -r (تخطي فك الموارد)، وده معناه إن الـ manifest
-        # بيفضل في صورته الثنائية الأصلية (binary AXML) مش نص XML قابل للقراءة.
-        # فمينفعش نتأكد من صحته كـ XML نصي هنا - وجوده وحجمه بس هو المؤشر المتاح.
-        pass
-
-    apktool_yml = os.path.join(project_dir, "apktool.yml")
-    if not os.path.isfile(apktool_yml):
+    original_apk = os.path.join(project_dir, "original.apk")
+    if not os.path.isfile(original_apk):
         problems.append(
-            "• ملف apktool.yml مش موجود. ده ملف الميتاداتا اللي apktool بيحتاجه\n"
-            "  عشان يعرف يجمّع المشروع تاني - من غيره التجميع مستحيل ينجح."
+            "• ملف original.apk (نسخة الاحتياط من الـ APK الأصلي) مش موجود.\n"
+            "  ده الملف اللي فيه الموارد والصور والـ manifest، ومحتاجينه وقت التجميع."
         )
+    elif os.path.getsize(original_apk) == 0:
+        problems.append("• ملف original.apk موجود لكنه فاضي (0 بايت).")
+    elif not zipfile.is_zipfile(original_apk):
+        problems.append("• ملف original.apk موجود لكنه تالف (مش zip/apk صحيح).")
 
     smali_dirs = sorted(
         d for d in glob.glob(os.path.join(project_dir, "smali*"))
