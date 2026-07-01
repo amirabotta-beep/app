@@ -1125,12 +1125,13 @@ def check_project_integrity(project_dir):
     manifest_path = os.path.join(project_dir, "AndroidManifest.xml")
     if not os.path.isfile(manifest_path):
         problems.append("• ملف AndroidManifest.xml مش موجود في مجلد المشروع (تم حذفه أو نقله؟).")
+    elif os.path.getsize(manifest_path) == 0:
+        problems.append("• ملف AndroidManifest.xml موجود لكنه فاضي (0 بايت) - غالبًا اتمسح محتواه بالغلط.")
     else:
-        try:
-            import xml.etree.ElementTree as ET
-            ET.parse(manifest_path)
-        except Exception as e:
-            problems.append(f"• AndroidManifest.xml تالف / XML غير صالح:\n   {e}")
+        # ملحوظة: الفك بيتم بفلاج -r (تخطي فك الموارد)، وده معناه إن الـ manifest
+        # بيفضل في صورته الثنائية الأصلية (binary AXML) مش نص XML قابل للقراءة.
+        # فمينفعش نتأكد من صحته كـ XML نصي هنا - وجوده وحجمه بس هو المؤشر المتاح.
+        pass
 
     apktool_yml = os.path.join(project_dir, "apktool.yml")
     if not os.path.isfile(apktool_yml):
