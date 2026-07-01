@@ -75,18 +75,27 @@ print(f"☕ Java path: {JAVA_BIN}  (محلي: {os.path.isfile(_LOCAL_JAVA_BIN)})
 # ملحوظة مهمة: لو المشروع كبير (multidex بعدد كبير من classesN.dex)، تشغيل
 # apktool بأكتر من thread (jobs) بيخلي عدة ملفات dex تتبني في نفس اللحظة،
 # وكل thread بياخد نصيبه من الرام بالتوازي - وده بيضاعف الذروة القصوى
-# للاستهلاك ويسبب SIGKILL (OOM) بسهولة على سيرفر 1GB. فبالنسبة للتطبيقات
-# الكبيرة، الاستقرار (jobs=1 وقت البناء) أهم من كسب ثواني قليلة بالتوازي.
+# للاستهلاك ويسبب SIGKILL (OOM) بسهولة على سيرفر 1GB. فـ jobs=1 وقت البناء
+# ثابت ومش بيتغير - ده اللي بيمنع الكراش. لكن بما إن العملية بقت تسلسلية
+# (thread واحد بس بيشتغل فعليًا)، نقدر نستغل الرام والـ CPU المتاحين
+# بأقصى قدر ممكن من غير ما نرجع لخطر التوازي في البناء نفسه:
+# - Xmx أعلى: تقليل عدد مرات الـ GC (كل ما الـ heap أكبر، كل ما بطّأ يحتاج ينضف)
+# - ParallelGC: التنضيف نفسه بيشتغل على الـ 2 vCPU بالتوازي (سرعة GC، مش سرعة بناء)
+#   وده مختلف تمامًا عن "jobs" اللي بيتحكم في عدد ملفات الـ dex اللي بتتبني
+#   في نفس اللحظة - هنا الـ CPU الإضافي بيسرّع تنظيف الذاكرة بس، مش بيفتح
+#   شغل تاني بيستهلك رام إضافي زي ما كان بيحصل قبل كده.
 JAVA_MEM_OPTS = [
-    "-Xms192m",
-    "-Xmx640m",                    # سقف محافظ يسيب مساحة كافية لـ overhead التوازي/الـ native buffers
-    "-XX:+UseSerialGC",            # أقل استهلاك رام إضافي مقارنة بـ Parallel/G1 (أهم من سرعة الـ GC هنا)
+    "-Xms320m",                    # heap ابتدائي أعلى: يقلل عدد مرات توسيع الـ heap أثناء الشغل
+    "-Xmx704m",                    # زيادة معقولة عن الـ 640m الأصلية (نقدر نزود أكتر لاحقًا لو ثبت إنها مستقرة)
+    "-XX:+UseParallelGC",          # الـ GC نفسه بيستفيد من الـ 2 vCPU (أسرع تنظيف، بدون توازي في البناء)
+    "-XX:ParallelGCThreads=2",
     "-XX:MaxMetaspaceSize=128m",
 ]
 # عدد الـ threads وقت الفك (أخف بكتير بسبب فلاج -r اللي بيتخطى فك الموارد)
 APKTOOL_JOBS_DECOMPILE = str(max(1, min(os.cpu_count() or 2, 2)))
-# عدد الـ threads وقت التجميع (build): job واحد بس، لأن بناء أكتر من dex
-# بالتوازي هو اللي بيسبب الـ OOM في التطبيقات الكبيرة (multidex)
+# عدد الـ threads وقت التجميع (build): job واحد بس - ثابت ومش بيتغير مهما
+# كان التطبيق كبير، لأن بناء أكتر من dex بالتوازي هو اللي بيسبب الـ OOM.
+# لو التطبيق كبير هياخد وقت أطول وده متوقع وسليم، بس مش هيكراش.
 APKTOOL_JOBS_BUILD = "1"
 # إبقاء الاسم القديم شغال في أي استخدام قديم متبقي (لو فيه) = وضع الفك
 APKTOOL_JOBS = APKTOOL_JOBS_DECOMPILE
@@ -198,24 +207,134 @@ def get_next_release_version_from_github(token: str, repo: str) -> str:
         return "v1"
 
 
-async def run_cmd_with_heartbeat(cmd, status_msg, base_text, interval=25):
+# =============================================================================
+# تقدير نسبة التقدم (%) — مفيش أداة زي apktool بتديك % حقيقية، فبنقدّرها
+# بالاعتماد على متوسط "ثانية لكل ميجابايت" من عمليات ناجحة سابقة، وبنحدّث
+# المتوسط ده تلقائيًا كل ما عملية جديدة تخلص (بيبقى أدق كل ما البوت يشتغل أكتر).
+# =============================================================================
+STATS_PATH = os.path.join(WORKSPACE_DIR, "build_stats.json")
+
+# قيم افتراضية أولية (ثانية/ميجابايت) لحد ما يتجمع بيانات حقيقية من التشغيل الفعلي
+_DEFAULT_RATE_PER_MB = {"decompile": 3.5, "build": 4.5, "sign": 1.5}
+
+
+def load_stats():
+    if not os.path.exists(STATS_PATH):
+        return {}
+    try:
+        with open(STATS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_stats(stats):
+    try:
+        with open(STATS_PATH, "w", encoding="utf-8") as f:
+            json.dump(stats, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def get_dir_size(path):
+    """يحسب حجم مجلد كامل بالبايت (بيتستخدم لتقدير وقت التجميع build)."""
+    total = 0
+    for root, _, files in os.walk(path):
+        for fn in files:
+            try:
+                total += os.path.getsize(os.path.join(root, fn))
+            except Exception:
+                pass
+    return total
+
+
+def estimate_seconds(stage, size_bytes):
     """
-    زي run_cmd بالظبط، لكن بيحدّث الرسالة كل `interval` ثانية بعداد وقت حي
-    عشان يبقى واضح إن العملية لسه شغالة ومش واقفة (مفيدة للتجميع والفك
-    للملفات الكبيرة اللي بتاخد وقت طويل من غير أي مخرجات وسيطة).
+    تقدير الوقت المتوقع (بالثواني) لمرحلة معيّنة (decompile/build/sign)
+    بناءً على حجم الملف/المشروع، ومتوسط الأداء الفعلي المسجّل من مرات سابقة.
     """
+    size_mb = max(size_bytes / (1024 * 1024), 0.1)
+    s = load_stats().get(stage, {})
+    total_seconds  = s.get("total_seconds", 0)
+    total_size_mb  = s.get("total_size_mb", 0)
+    if total_size_mb > 0.5:  # فيه بيانات كفاية من مرات سابقة
+        rate = total_seconds / total_size_mb
+    else:
+        rate = _DEFAULT_RATE_PER_MB.get(stage, 3.0)
+    return max(5, rate * size_mb)
+
+
+def record_stage_time(stage, size_bytes, elapsed_seconds):
+    """يحدّث متوسط الأداء بعد ما مرحلة تخلص بنجاح، عشان التقدير يبقى أدق مرة بعد مرة."""
+    size_mb = max(size_bytes / (1024 * 1024), 0.1)
+    stats = load_stats()
+    s = stats.setdefault(stage, {"total_seconds": 0.0, "total_size_mb": 0.0, "samples": 0})
+    s["total_seconds"] += elapsed_seconds
+    s["total_size_mb"] += size_mb
+    s["samples"]       += 1
+    # نخلي المتوسط بيتبع آخر ~15 عملية بس (decay) عشان يفضل متأقلم لو أداء
+    # السيرفر اتغير، مش متجمّد على متوسط عمر البوت كله
+    if s["samples"] > 15:
+        factor = 15 / s["samples"]
+        s["total_seconds"] *= factor
+        s["total_size_mb"] *= factor
+        s["samples"] = 15
+    save_stats(stats)
+
+
+def format_progress_bar(pct, width=10):
+    filled = int(round(pct / 100 * width))
+    filled = max(0, min(width, filled))
+    return "▓" * filled + "░" * (width - filled)
+
+
+def format_duration(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds} ثانية"
+    m, s = divmod(seconds, 60)
+    return f"{m} دقيقة و{s} ثانية" if s else f"{m} دقيقة"
+
+
+async def run_cmd_with_heartbeat(cmd, status_msg, base_text, interval=6, estimated_seconds=None, stage=None, size_bytes=None):
+    """
+    زي run_cmd بالظبط، لكن بيحدّث الرسالة كل `interval` ثانية.
+
+    لو اتبعتله estimated_seconds، بيعرض progress bar ونسبة % تقديرية (زي
+    شريط تحميل تطبيق عادي) بناءً على متوسط أداء العمليات السابقة، وبتفضل
+    واقفة عند 99% لحد ما العملية تخلص فعليًا (عشان منديش انطباع كدب إنها
+    خلصت وهي لسه شغالة). لو مفيش تقدير متاح، بيرجع للعداد القديم (وقت مرّ بس).
+
+    بيرجع: (ok: bool, log_text: str, elapsed_seconds: float)
+    """
+    start = time.time()
     task = asyncio.ensure_future(run_cmd(cmd))
-    elapsed = 0
     while not task.done():
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=interval)
         except asyncio.TimeoutError:
-            elapsed += interval
+            elapsed = time.time() - start
             try:
-                await status_msg.edit_text(f"{base_text}\n⏱ لسه شغال... ({elapsed} ثانية)")
+                if estimated_seconds and estimated_seconds > 0:
+                    pct = min(99, int(elapsed / estimated_seconds * 100))
+                    bar = format_progress_bar(pct)
+                    remaining = max(1, estimated_seconds - elapsed)
+                    await status_msg.edit_text(
+                        f"{base_text}\n{bar}  {pct}%\n"
+                        f"⏱ مضى {format_duration(elapsed)} — تقريبًا متبقي {format_duration(remaining)}"
+                    )
+                else:
+                    await status_msg.edit_text(f"{base_text}\n⏱ لسه شغال... ({int(elapsed)} ثانية)")
             except Exception:
                 pass
-    return await task
+    ok, log_text = await task
+    elapsed_total = time.time() - start
+    if ok and stage and size_bytes:
+        try:
+            record_stage_time(stage, size_bytes, elapsed_total)
+        except Exception:
+            pass
+    return ok, log_text, elapsed_total
 
 
 # =============================================================================
@@ -787,13 +906,16 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             shutil.rmtree(PROJECT_DIR, ignore_errors=True)
 
         await msg.edit_text("⏳ جاري فك الـ APK (apktool)...")
-        ok, log_text = await run_cmd_with_heartbeat(
+        apk_size = os.path.getsize(APK_COPY_PATH)
+        est = estimate_seconds("decompile", apk_size)
+        ok, log_text, elapsed = await run_cmd_with_heartbeat(
             [JAVA_BIN, *JAVA_MEM_OPTS, "-jar", APKTOOL_JAR, "d", APK_COPY_PATH, "-o", PROJECT_DIR, "-f", "-r", "-j", APKTOOL_JOBS],
             msg, "⏳ جاري فك الـ APK (apktool)...",
+            estimated_seconds=est, stage="decompile", size_bytes=apk_size,
         )
 
         if ok:
-            await msg.edit_text("✅ تم فك الـ APK بنجاح.\n" + tail_log(log_text))
+            await msg.edit_text(f"✅ تم فك الـ APK بنجاح في {format_duration(elapsed)}.\n" + tail_log(log_text))
             await update.message.reply_text("📋 القائمة الرئيسية:", reply_markup=main_menu_kb())
         else:
             await msg.edit_text("❌ فشلت عملية الفك:\n" + tail_log(log_text, 1500), reply_markup=main_menu_kb())
@@ -953,16 +1075,20 @@ async def do_build_and_sign(context, chat_id, status_msg, uid, mode, ks_name=Non
     if os.path.isdir(dist_dir):
         shutil.rmtree(dist_dir, ignore_errors=True)
 
+    project_size = get_dir_size(PROJECT_DIR)
+    est_build = estimate_seconds("build", project_size)
     await status_msg.edit_text("⏳ 1) جاري تجميع المشروع (apktool build)...")
-    ok, log_text = await run_cmd_with_heartbeat(
+    ok, log_text, build_elapsed = await run_cmd_with_heartbeat(
         [JAVA_BIN, *JAVA_MEM_OPTS, "-jar", APKTOOL_JAR, "b", PROJECT_DIR, "-o", unsigned_apk, "-j", APKTOOL_JOBS_BUILD],
         status_msg, "⏳ 1) جاري تجميع المشروع (apktool build)...",
+        estimated_seconds=est_build, stage="build", size_bytes=project_size,
     )
     if not ok or not os.path.isfile(unsigned_apk):
         await status_msg.edit_text("❌ فشل التجميع:\n" + tail_log(log_text), reply_markup=main_menu_kb())
         return
 
-    await status_msg.edit_text("✅ تم التجميع.\n⏳ 2) جاري التوقيع (uber-apk-signer)...")
+    build_done_text = f"✅ 1) تم التجميع في {format_duration(build_elapsed)}."
+    await status_msg.edit_text(f"{build_done_text}\n⏳ 2) جاري التوقيع (uber-apk-signer)...")
 
     tmp_out_dir = os.path.join(WORKSPACE_DIR, "sign_tmp_" + random_string(6))
     os.makedirs(tmp_out_dir, exist_ok=True)
@@ -981,7 +1107,12 @@ async def do_build_and_sign(context, chat_id, status_msg, uid, mode, ks_name=Non
             "--ksKeyPass", ks.get("keypass") or ks["storepass"],
         ]
 
-    ok, sign_log = await run_cmd_with_heartbeat(cmd, status_msg, "✅ تم التجميع.\n⏳ 2) جاري التوقيع (uber-apk-signer)...")
+    unsigned_size = os.path.getsize(unsigned_apk)
+    est_sign = estimate_seconds("sign", unsigned_size)
+    ok, sign_log, sign_elapsed = await run_cmd_with_heartbeat(
+        cmd, status_msg, f"{build_done_text}\n⏳ 2) جاري التوقيع (uber-apk-signer)...",
+        estimated_seconds=est_sign, stage="sign", size_bytes=unsigned_size,
+    )
     try:
         os.remove(unsigned_apk)
     except Exception:
@@ -1007,8 +1138,11 @@ async def do_build_and_sign(context, chat_id, status_msg, uid, mode, ks_name=Non
     st["signed_apk_path"]   = out_apk
     st["original_apk_name"] = st.get("original_apk_name") or "signed_app.apk"
 
+    total_elapsed = build_elapsed + sign_elapsed
     await status_msg.edit_text(
-        "✅ تم التجميع والتوقيع بنجاح!\n\n📤 فين عايز ترفع الـ APK؟",
+        "✅ تم التجميع والتوقيع بنجاح!\n"
+        f"⏱ التجميع: {format_duration(build_elapsed)}  |  التوقيع: {format_duration(sign_elapsed)}  |  الإجمالي: {format_duration(total_elapsed)}\n\n"
+        "📤 فين عايز ترفع الـ APK؟",
         reply_markup=upload_destination_kb(),
     )
 
@@ -1716,9 +1850,12 @@ async def _handle_callback(query, context, uid, data, st):
         if os.path.isdir(PROJECT_DIR):
             shutil.rmtree(PROJECT_DIR, ignore_errors=True)
         msg = await query.edit_message_text("⏳ جاري فك الـ APK (apktool)...")
-        ok, log_text = await run_cmd_with_heartbeat(
+        apk_size = os.path.getsize(APK_COPY_PATH)
+        est = estimate_seconds("decompile", apk_size)
+        ok, log_text, elapsed = await run_cmd_with_heartbeat(
             [JAVA_BIN, *JAVA_MEM_OPTS, "-jar", APKTOOL_JAR, "d", APK_COPY_PATH, "-o", PROJECT_DIR, "-f", "-r", "-j", APKTOOL_JOBS],
             msg, "⏳ جاري فك الـ APK (apktool)...",
+            estimated_seconds=est, stage="decompile", size_bytes=apk_size,
         )
         try:
             os.remove(apk_path)
@@ -1726,7 +1863,7 @@ async def _handle_callback(query, context, uid, data, st):
             pass
         get_state(uid).pop("downloaded_apk_path", None)
         if ok:
-            await msg.edit_text("✅ تم فك الـ APK بنجاح.\n" + tail_log(log_text))
+            await msg.edit_text(f"✅ تم فك الـ APK بنجاح في {format_duration(elapsed)}.\n" + tail_log(log_text))
             await context.bot.send_message(query.message.chat_id, "📋 القائمة الرئيسية:", reply_markup=main_menu_kb())
         else:
             await msg.edit_text("❌ فشلت عملية الفك:\n" + tail_log(log_text, 1500), reply_markup=main_menu_kb())
