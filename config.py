@@ -1,7 +1,7 @@
 # =========================================================
 # ⚙️  ملف الإعدادات — لا ترفعه على GitHub
 # =========================================================
-GITHUB_TOKEN   = "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"
+GITHUB_TOKEN   = "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"
 TELEGRAM_TOKEN = "8721590192:AAFcAdOZaiDyL5P1D24r6qDPvvwTJ4_i8ek"
 TELEGRAM_CHAT  = "8080767364"
 REPO_NAME      = "V00ltTech/app"
