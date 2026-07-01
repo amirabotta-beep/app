@@ -200,8 +200,9 @@ def find_keystore(name):
 def get_next_release_version_from_github(token: str, repo: str) -> str:
     """
     يجيب آخر release من GitHub ويزود رقمه 1.
-    لو مفيش releases خالص يبدأ من v1.
-    لو الـ tag مش على شكل vN يزود 1 على آخر رقم لاقيه.
+    لو مفيش releases خالص يبدأ من 1.
+    التاج بيتعمل برقم عادي بدون حرف v (1, 2, 3...) عشان يتماشى مع
+    التاجات القديمة الموجودة فعلاً على الريبو (كانت "1", "2" من غير v).
     """
     headers = {
         "Authorization": f"token {token}",
@@ -215,16 +216,16 @@ def get_next_release_version_from_github(token: str, repo: str) -> str:
         )
         if r.status_code == 404:
             # مفيش releases خالص
-            return "v1"
+            return "1"
         r.raise_for_status()
-        tag = r.json().get("tag_name", "v0")
-        # استخرج الرقم من الـ tag (مثلاً v7 → 7)
+        tag = r.json().get("tag_name", "0")
+        # استخرج الرقم من الـ tag (بيشتغل مع "7" أو حتى "v7" القديمة لو لقاها)
         m = re.search(r"(\d+)$", tag)
         last_num = int(m.group(1)) if m else 0
-        return f"v{last_num + 1}"
+        return str(last_num + 1)
     except Exception:
-        # لو فشل الاتصال، ارجع v1 كـ fallback
-        return "v1"
+        # لو فشل الاتصال، ارجع 1 كـ fallback
+        return "1"
 
 
 # =============================================================================
@@ -991,7 +992,7 @@ async def send_long_text(context, chat_id, text):
 def github_upload_sync(apk_path: str, apk_original_name: str) -> tuple[bool, str]:
     """
     يعمل GitHub Release ويرفع عليه الـ APK.
-    - tag/version تلقائي (v1, v2, ...)
+    - tag/version تلقائي (1, 2, 3, ...)
     - اسم الـ release = اسم ملف الـ APK الأصلي
     يرجع (success, message_or_url)
     """
@@ -1023,6 +1024,18 @@ def github_upload_sync(apk_path: str, apk_original_name: str) -> tuple[bool, str
     }
     try:
         r = requests.post(create_url, headers=headers, json=payload, timeout=30)
+        if r.status_code == 401:
+            return False, (
+                "❌ التوكن (github_token) مرفوض من GitHub (401 Bad credentials).\n"
+                "التوكن نفسه منتهي/ملغي/غلط — مش مشكلة في صلاحيات أو في الكود.\n"
+                "روح اعمل توكن جديد من GitHub → Settings → Developer settings،\n"
+                "وحدّثه في config.json، وبعدين اعمل ريستارت للبوت."
+            )
+        if r.status_code == 404:
+            return False, (
+                f"❌ الريبو `{repo}` مش موجود أو التوكن مالوش صلاحية وصول عليه.\n"
+                "تأكد من اسم الريبو في github_repo وإن التوكن معطي صلاحية Contents: Read and write عليه."
+            )
         r.raise_for_status()
         release_data = r.json()
     except requests.HTTPError as e:
