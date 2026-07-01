@@ -1083,6 +1083,7 @@ def main_menu_kb():
         [InlineKeyboardButton("🔍 بحث واستبدال smali", callback_data="menu_search")],
         [InlineKeyboardButton("📦 نقل classes.zip", callback_data="menu_classes")],
         [InlineKeyboardButton("🔑 إدارة شهادات التوقيع", callback_data="menu_keystores")],
+        [InlineKeyboardButton("🐙 تحديث توكن GitHub", callback_data="menu_update_github_token")],
         [InlineKeyboardButton("☕ فحص/تحميل Java", callback_data="menu_check_java")],
         [InlineKeyboardButton("🛠 فحص/تحميل أدوات APK", callback_data="menu_check_tools")],
         [InlineKeyboardButton("🗑 حذف المشروع الحالي", callback_data="menu_delete_project")],
@@ -1228,6 +1229,74 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st       = get_state(uid)
     awaiting = st.get("await")
     text     = update.message.text.strip()
+
+    if awaiting == "new_github_token":
+        new_token = text
+        st.pop("await", None)
+
+        # امسح رسالة المستخدم اللي فيها التوكن فورًا — أمان، عشان
+        # التوكن ميفضلش نص ظاهر في تاريخ الشات.
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        status_msg = await context.bot.send_message(
+            update.effective_chat.id, "⏳ جاري التحقق من التوكن..."
+        )
+
+        # فحص سريع: التوكن شغال ولا لأ (401 = مرفوض من GitHub)
+        try:
+            check = requests.get(
+                "https://api.github.com/user",
+                headers={"Authorization": f"token {new_token}"},
+                timeout=15,
+            )
+        except Exception as e:
+            await status_msg.edit_text(f"❌ فشل الاتصال بـ GitHub للتحقق من التوكن:\n{e}")
+            return
+
+        if check.status_code == 401:
+            await status_msg.edit_text(
+                "❌ التوكن مرفوض من GitHub (401 Bad credentials).\n"
+                "اتأكد إنك نسخته كامل من غير مسافات، وإنه لسه صالح ومش ملغي، وحاول تاني.",
+                reply_markup=main_menu_kb(),
+            )
+            return
+
+        # احفظ التوكن مباشرة في config.json (تحديث صريح ومقصود من الأدمن)
+        try:
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+            else:
+                existing = dict(DEFAULT_CONFIG)
+        except Exception:
+            existing = dict(DEFAULT_CONFIG)
+        existing["github_token"] = new_token
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+        CFG["github_token"] = new_token
+
+        repo = CFG.get("github_repo", "").strip()
+        extra_note = ""
+        if repo:
+            r2 = requests.get(
+                f"https://api.github.com/repos/{repo}",
+                headers={"Authorization": f"token {new_token}"},
+                timeout=15,
+            )
+            if r2.status_code == 404:
+                extra_note = (
+                    f"\n⚠️ تحذير: التوكن شغال، لكن مفيش وصول للريبو `{repo}` — "
+                    "تأكد إن التوكن ده معطي صلاحية Contents: Read and write على الريبو ده بالتحديد."
+                )
+
+        await status_msg.edit_text(
+            "✅ تم حفظ توكن GitHub الجديد والتحقق منه بنجاح." + extra_note,
+            reply_markup=main_menu_kb(),
+        )
+        return
 
     if awaiting in ("new_ks_name_for_build", "new_ks_name_standalone"):
         if find_keystore(text):
@@ -2114,6 +2183,18 @@ async def _handle_callback(query, context, uid, data, st):
     elif data == "ksnew_standalone":
         st["await"] = "new_ks_name_standalone"
         await query.edit_message_text("✍️ اكتب اسم لهذا التوقيع الجديد:")
+
+    # ── تحديث توكن GitHub ──
+    elif data == "menu_update_github_token":
+        st["await"] = "new_github_token"
+        current_repo = CFG.get("github_repo", "غير محدد")
+        await query.edit_message_text(
+            "🐙 تحديث توكن GitHub\n\n"
+            f"الريبو الحالي: `{current_repo}`\n\n"
+            "ابعت التوكن الجديد (Personal Access Token) دلوقتي كرسالة واحدة.\n"
+            "⚠️ همسح رسالتك اللي فيها التوكن فورًا من الشات بعد الحفظ، "
+            "عشان ميفضلش ظاهر في تاريخ المحادثة."
+        )
 
     # ── تنزيل من رابط ──
     elif data == "menu_download_url":
