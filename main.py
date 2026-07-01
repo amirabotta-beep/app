@@ -1016,35 +1016,52 @@ def github_upload_sync(apk_path: str, apk_original_name: str) -> tuple[bool, str
         "Content-Type" : "application/json",
     }
 
-    # 1) إنشاء Release
+    # 1) إنشاء Release — مع retry تلقائي لو التاج مستخدم بالفعل (العداد
+    # المحلي كان متأخر عن آخر رقم فعلي على GitHub لأي سبب)، بنجرب أرقام
+    # تالية لحد ما نلاقي واحد فاضي، وبنصحّح العداد المحلي بعدها.
     create_url = f"https://api.github.com/repos/{repo}/releases"
-    payload = {
-        "tag_name"  : tag_name,
-        "name"      : release_name,
-        "body"      : f"🤖 رُفع تلقائياً بواسطة بوت APK\n📦 الملف الأصلي: `{apk_original_name}`",
-        "draft"     : False,
-        "prerelease": False,
-    }
-    try:
-        r = requests.post(create_url, headers=headers, json=payload, timeout=30)
+    max_attempts = 20
+    release_data = None
+    r = None
+    for attempt in range(max_attempts):
+        payload = {
+            "tag_name"  : tag_name,
+            "name"      : release_name,
+            "body"      : f"🤖 رُفع تلقائياً بواسطة بوت APK\n📦 الملف الأصلي: `{apk_original_name}`",
+            "draft"     : False,
+            "prerelease": False,
+        }
+        try:
+            r = requests.post(create_url, headers=headers, json=payload, timeout=30)
+        except Exception as e:
+            return False, f"❌ خطأ في الاتصال بـ GitHub:\n{e}"
+
         if r.status_code == 401:
             return False, (
                 "❌ التوكن (github_token) مرفوض من GitHub (401 Bad credentials).\n"
                 "التوكن نفسه منتهي/ملغي/غلط — مش مشكلة في صلاحيات أو في الكود.\n"
                 "روح اعمل توكن جديد من GitHub → Settings → Developer settings،\n"
-                "وحدّثه في config.json، وبعدين اعمل ريستارت للبوت."
+                "وحدّثه من زرار \"🐙 تحديث توكن GitHub\" في القائمة الرئيسية."
             )
         if r.status_code == 404:
             return False, (
                 f"❌ الريبو `{repo}` مش موجود أو التوكن مالوش صلاحية وصول عليه.\n"
                 "تأكد من اسم الريبو في github_repo وإن التوكن معطي صلاحية Contents: Read and write عليه."
             )
-        r.raise_for_status()
-        release_data = r.json()
-    except requests.HTTPError as e:
-        return False, f"❌ فشل إنشاء الـ Release:\n{e}\n{r.text[:300]}"
-    except Exception as e:
-        return False, f"❌ خطأ في الاتصال بـ GitHub:\n{e}"
+        if r.status_code == 422 and "already_exists" in r.text:
+            # التاج ده مستخدم فعلاً على GitHub — جرّب الرقم اللي بعده
+            tag_name = str(int(tag_name) + 1)
+            continue
+
+        try:
+            r.raise_for_status()
+            release_data = r.json()
+        except requests.HTTPError as e:
+            return False, f"❌ فشل إنشاء الـ Release:\n{e}\n{r.text[:300]}"
+        break
+
+    if release_data is None:
+        return False, "❌ فشل إنشاء الـ Release: مفيش رقم إصدار فاضي بعد عدة محاولات، راجع الـ Releases يدويًا على GitHub."
 
     # الـ Release اتعمل بنجاح على GitHub بالفعل (التاج ده بقى مستخدم)،
     # فلازم نحفظ العداد دلوقتي حتى لو رفع الملف نفسه فشل بعد كده — عشان
