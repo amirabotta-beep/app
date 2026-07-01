@@ -1104,7 +1104,7 @@ def do_search_only_sync(project_dir, search_text):
             files_count += 1
             rel = os.path.relpath(fpath, project_dir)
             out_lines.append(f"📄 {rel} ({len(matches)} نتيجة)")
-            for ln, content in matches[:10]:
+            for ln, content in matches:
                 out_lines.append(f"   سطر {ln}: {content}")
             total += len(matches)
     if total == 0:
@@ -1181,7 +1181,7 @@ def do_insert_after_sync(project_dir, search_text, insert_text):
             backup_path = os.path.join(backup_dir, rel)
             os.makedirs(os.path.dirname(backup_path), exist_ok=True)
             try:
-                with open(backup_path, "w", encoding="utf-8\n") as f:
+                with open(backup_path, "w", encoding="utf-8") as f:
                     f.writelines(lines)
             except Exception:
                 pass
