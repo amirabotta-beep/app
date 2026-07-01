@@ -6,8 +6,7 @@
   "keystores": [
     8080767364
   ],
-  "github_token": "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",
+  "github_token": "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",
   "github_repo": "V00ltTech/app",
-  "github_key_path": "",
-  "release_counter": 2
+  "github_key_path": ""
 }
