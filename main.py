@@ -32,6 +32,7 @@ import asyncio
 import logging
 import subprocess
 import requests
+import datetime
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -79,6 +80,20 @@ APKTOOL_JOBS = "2"
 
 for _d in (TOOLS_DIR, WORKSPACE_DIR, KEYSTORES_DIR):
     os.makedirs(_d, exist_ok=True)
+
+# =============================================================================
+# معرّف النسخة (Instance ID) — عشان تقدر تفرّق بين أكتر من نسخة شغالة بالغلط
+# =============================================================================
+# لو Railway حاطط متغير بيتغير مع كل ديبلوي جديد (زي RAILWAY_DEPLOYMENT_ID أو
+# RAILWAY_GIT_COMMIT_SHA) بنستخدمه، وإلا بنولد معرّف عشوائي وقت التشغيل.
+_DEPLOY_TAG = (
+    os.environ.get("RAILWAY_DEPLOYMENT_ID")
+    or os.environ.get("RAILWAY_GIT_COMMIT_SHA", "")[:8]
+    or ""
+)
+BOOT_TIME   = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+INSTANCE_ID = f"{_DEPLOY_TAG or 'local'}-{''.join(random.choices(string.ascii_letters + string.digits, k=5))}"
+print(f"🆔 Instance ID: {INSTANCE_ID}  |  ⏱ Boot time: {BOOT_TIME}")
 
 DEFAULT_CONFIG = {
     "bot_token"      : "PUT_YOUR_BOT_TOKEN_HERE",
@@ -675,6 +690,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 أهلاً بيك في بوت فك وتجميع وتوقيع APK.\n\n"
         + project_status_text()
+        + f"\n\n🆔 نسخة التشغيل: `{INSTANCE_ID}` (اشتغلت الساعة {BOOT_TIME})\n"
+          "(لو دوست /start تاني وطلعلك معرّف مختلف كل مرة بسرعة، معناه فيه أكتر من نسخة بتتقاتل)"
         + "\n\n📥 ابعت ملف APK دلوقتي وأنا هبدأ أفكه تلقائي، أو اختار من القائمة:",
         reply_markup=main_menu_kb(),
     )
@@ -1447,9 +1464,32 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     data = query.data
-    await query.answer()
-    st = get_state(uid)
+    st   = get_state(uid)
 
+    # ── قفل ضد الضغط المزدوج / السريع على عمليات تقيلة بتلمس ملفات المشروع ──
+    # (فك APK، تجميع وتوقيع، تنفيذ بحث/استبدال/حذف/إضافة) عشان نمنع تشغيل
+    # نفس العملية مرتين في نفس الوقت وتسبب حذف/تلف لمجلد المشروع وهو لسه شغال.
+    HEAVY_ACTIONS = {
+        "dl_decompile", "sign_random", "menu_build",
+        "confirm_delete", "confirm_replace", "confirm_insert",
+    }
+    is_heavy = data in HEAVY_ACTIONS or data.startswith("ksbuild:")
+    if is_heavy and st.get("busy"):
+        await query.answer("⏳ في عملية شغالة بالفعل، استنى تخلص الأول.", show_alert=True)
+        return
+    if is_heavy:
+        st["busy"] = True
+
+    await query.answer()
+
+    try:
+        await _handle_callback(query, context, uid, data, st)
+    finally:
+        if is_heavy:
+            st["busy"] = False
+
+
+async def _handle_callback(query, context, uid, data, st):
     # ── رجوع ──
     if data == "back_main":
         reset_state(uid)
@@ -1611,18 +1651,30 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    log.info("🚀 البوت شغال...")
-    # drop_pending_updates=True: يمسح أي رسائل/كولباك متراكمة من نسخة قديمة عالقة
-    # قبل ما يبدأ يستقبل رسائل جديدة، عشان نقلل أثر أي نسخة تانية كانت شغالة بالغلط.
+    log.info(f"🚀 البوت شغال... (Instance: {INSTANCE_ID})")
+    # drop_pending_updates=True: يمسح أي رسائل/كولباك متراكمة من نسخة قديمة عالقة،
+    # وده كمان بيستحوذ فورًا على جلسة الـ long-polling ويطرد أي نسخة تانية شغالة
+    # بنفس التوكن (تليجرام مش بيسمح إلا بمستهلك getUpdates واحد بس في نفس الوقت).
     try:
         app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     except Exception as e:
-        if "Conflict" in str(e) or "terminated by other getUpdates" in str(e):
+        is_conflict = "Conflict" in str(e) or "terminated by other getUpdates" in str(e)
+        if is_conflict:
+            # فيه نسخة تانية استحوذت على الـ polling بعدنا (يعني هي الأحدث غالبًا).
+            # بدل ما نموت ونخلي Railway يعيد تشغيلنا فورًا فنتخانق تاني على طول
+            # (وده اللي بيسبب فلاشينج القوائم واختفاء زرارين وظهورهم بالتبادل)،
+            # ننتظر فترة عشوائية طويلة نسبيًا الأول، عشان نسيب فرصة حقيقية
+            # للنسخة التانية إنها تستقر، وبعدين نخرج بكود خطأ يخلي Railway
+            # يعرف إن التشغيل ده فشل عمدًا.
+            backoff = random.randint(45, 90)
             log.error(
-                "🚨 تعارض: في نسخة تانية من البوت شغالة بنفس التوكن دلوقتي!\n"
-                "روح Railway → Deployments وتأكد إن مفيش أكتر من deployment/replica شغال،\n"
+                f"🚨 تعارض: في نسخة تانية من البوت شغالة بنفس التوكن دلوقتي! (Instance: {INSTANCE_ID})\n"
+                f"⏳ هستنى {backoff} ثانية قبل ما أطلع، عشان منتخانقش مع النسخة التانية.\n"
+                "لحل المشكلة نهائيًا: روح Railway → Deployments وتأكد إن مفيش أكتر من\n"
+                "deployment/replica شغال في نفس الوقت (احذف/أوقف أي نسخة قديمة يدويًا)،\n"
                 "أو إنك مش مشغّل نسخة تانية محليًا على جهازك في نفس الوقت."
             )
+            time.sleep(backoff)
         raise
 
 
