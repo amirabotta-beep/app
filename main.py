@@ -152,20 +152,42 @@ DEFAULT_CONFIG = {
 def load_config():
     if not os.path.exists(CONFIG_PATH):
         save_config(DEFAULT_CONFIG)
-        return dict(DEFAULT_CONFIG)
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        for k, v in DEFAULT_CONFIG.items():
-            cfg.setdefault(k, v)
-        return cfg
-    except Exception:
-        return dict(DEFAULT_CONFIG)
+        cfg = dict(DEFAULT_CONFIG)
+    else:
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            for k, v in DEFAULT_CONFIG.items():
+                cfg.setdefault(k, v)
+        except Exception:
+            cfg = dict(DEFAULT_CONFIG)
+
+    # ── الأسرار: لو متعرّفة كـ environment variables على السيرفر (زي Railway)،
+    # بتاخد الأولوية على قيم config.json. ده بيسمح إنك تسيب config.json
+    # فاضي من الأسرار الحقيقية وميبقاش خطر لو اترفع لـ Git بالغلط.
+    cfg["bot_token"]    = os.environ.get("BOT_TOKEN", cfg.get("bot_token", ""))
+    cfg["github_token"] = os.environ.get("GITHUB_TOKEN", cfg.get("github_token", ""))
+
+    return cfg
 
 
 def save_config(cfg):
+    # ── لا نكتب أبدًا القيم الفعلية لـ bot_token/github_token اللي كانت جايه
+    # من environment variables في وقت التشغيل — عشان نمنع تسرّبها لملف
+    # config.json (اللي ممكن يترفع لـ Git بالغلط). لو الملف الأصلي كان فيه
+    # قيمة (أو فاضي)، بنحافظ عليها زي ما هي بدل قيمة الـ runtime.
+    to_write = dict(cfg)
+    try:
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+            for secret_key in ("bot_token", "github_token"):
+                if secret_key in existing:
+                    to_write[secret_key] = existing[secret_key]
+    except Exception:
+        pass
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+        json.dump(to_write, f, ensure_ascii=False, indent=2)
 
 
 CFG = load_config()
