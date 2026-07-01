@@ -70,6 +70,13 @@ _LOCAL_JAVA_BIN = os.path.join(TOOLS_DIR, "jre", "bin", "java")
 JAVA_BIN = _LOCAL_JAVA_BIN if os.path.isfile(_LOCAL_JAVA_BIN) else "java"
 print(f"☕ Java path: {JAVA_BIN}  (محلي: {os.path.isfile(_LOCAL_JAVA_BIN)})")
 
+# ── إعدادات ذاكرة الجافا: مضبوطة لسيرفر محدود بـ 1GB RAM / 2 vCPU (Railway) ──
+# -Xmx640m  : سقف واضح للـ heap (يسيب مساحة للبوت نفسه وللنظام من أصل 1GB)
+# UseSerialGC: جامع قمامة أخف بكتير من الافتراضي (G1) على أجهزة قليلة الموارد
+JAVA_MEM_OPTS = ["-Xmx640m", "-XX:+UseSerialGC"]
+# عدد الـ threads اللي apktool يستخدمها، مطابق لعدد الـ vCPU الفعلي بدل القيمة الافتراضية (8)
+APKTOOL_JOBS = "2"
+
 for _d in (TOOLS_DIR, WORKSPACE_DIR, KEYSTORES_DIR):
     os.makedirs(_d, exist_ok=True)
 
@@ -730,7 +737,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             shutil.rmtree(PROJECT_DIR, ignore_errors=True)
 
         await msg.edit_text("⏳ جاري فك الـ APK (apktool)...")
-        ok, log_text = await run_cmd([JAVA_BIN, "-jar", APKTOOL_JAR, "d", APK_COPY_PATH, "-o", PROJECT_DIR, "-f"])
+        ok, log_text = await run_cmd([JAVA_BIN, *JAVA_MEM_OPTS, "-jar", APKTOOL_JAR, "d", APK_COPY_PATH, "-o", PROJECT_DIR, "-f", "-r", "-j", APKTOOL_JOBS])
 
         if ok:
             await msg.edit_text("✅ تم فك الـ APK بنجاح.\n" + tail_log(log_text))
@@ -888,7 +895,7 @@ async def do_build_and_sign(context, chat_id, status_msg, uid, mode, ks_name=Non
         shutil.rmtree(dist_dir, ignore_errors=True)
 
     await status_msg.edit_text("⏳ 1) جاري تجميع المشروع (apktool build)...")
-    ok, log_text = await run_cmd([JAVA_BIN, "-jar", APKTOOL_JAR, "b", PROJECT_DIR, "-o", unsigned_apk])
+    ok, log_text = await run_cmd([JAVA_BIN, *JAVA_MEM_OPTS, "-jar", APKTOOL_JAR, "b", PROJECT_DIR, "-o", unsigned_apk, "-j", APKTOOL_JOBS])
     if not ok or not os.path.isfile(unsigned_apk):
         await status_msg.edit_text("❌ فشل التجميع:\n" + tail_log(log_text), reply_markup=main_menu_kb())
         return
@@ -897,7 +904,7 @@ async def do_build_and_sign(context, chat_id, status_msg, uid, mode, ks_name=Non
 
     tmp_out_dir = os.path.join(WORKSPACE_DIR, "sign_tmp_" + random_string(6))
     os.makedirs(tmp_out_dir, exist_ok=True)
-    cmd = [JAVA_BIN, "-jar", UBER_SIGNER_JAR, "--apks", unsigned_apk, "--out", tmp_out_dir, "--allowResign"]
+    cmd = [JAVA_BIN, *JAVA_MEM_OPTS, "-jar", UBER_SIGNER_JAR, "--apks", unsigned_apk, "--out", tmp_out_dir, "--allowResign"]
 
     if mode == "custom":
         ks = find_keystore(ks_name)
@@ -1565,7 +1572,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if os.path.isdir(PROJECT_DIR):
             shutil.rmtree(PROJECT_DIR, ignore_errors=True)
         msg = await query.edit_message_text("⏳ جاري فك الـ APK (apktool)...")
-        ok, log_text = await run_cmd([JAVA_BIN, "-jar", APKTOOL_JAR, "d", APK_COPY_PATH, "-o", PROJECT_DIR, "-f"])
+        ok, log_text = await run_cmd([JAVA_BIN, *JAVA_MEM_OPTS, "-jar", APKTOOL_JAR, "d", APK_COPY_PATH, "-o", PROJECT_DIR, "-f", "-r", "-j", APKTOOL_JOBS])
         try:
             os.remove(apk_path)
         except Exception:
