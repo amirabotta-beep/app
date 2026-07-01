@@ -185,6 +185,26 @@ def get_next_release_version_from_github(token: str, repo: str) -> str:
         return "v1"
 
 
+async def run_cmd_with_heartbeat(cmd, status_msg, base_text, interval=25):
+    """
+    زي run_cmd بالظبط، لكن بيحدّث الرسالة كل `interval` ثانية بعداد وقت حي
+    عشان يبقى واضح إن العملية لسه شغالة ومش واقفة (مفيدة للتجميع والفك
+    للملفات الكبيرة اللي بتاخد وقت طويل من غير أي مخرجات وسيطة).
+    """
+    task = asyncio.ensure_future(run_cmd(cmd))
+    elapsed = 0
+    while not task.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=interval)
+        except asyncio.TimeoutError:
+            elapsed += interval
+            try:
+                await status_msg.edit_text(f"{base_text}\n⏱ لسه شغال... ({elapsed} ثانية)")
+            except Exception:
+                pass
+    return await task
+
+
 # =============================================================================
 # تشغيل أوامر خارجية
 # =============================================================================
@@ -754,7 +774,10 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             shutil.rmtree(PROJECT_DIR, ignore_errors=True)
 
         await msg.edit_text("⏳ جاري فك الـ APK (apktool)...")
-        ok, log_text = await run_cmd([JAVA_BIN, *JAVA_MEM_OPTS, "-jar", APKTOOL_JAR, "d", APK_COPY_PATH, "-o", PROJECT_DIR, "-f", "-r", "-j", APKTOOL_JOBS])
+        ok, log_text = await run_cmd_with_heartbeat(
+            [JAVA_BIN, *JAVA_MEM_OPTS, "-jar", APKTOOL_JAR, "d", APK_COPY_PATH, "-o", PROJECT_DIR, "-f", "-r", "-j", APKTOOL_JOBS],
+            msg, "⏳ جاري فك الـ APK (apktool)...",
+        )
 
         if ok:
             await msg.edit_text("✅ تم فك الـ APK بنجاح.\n" + tail_log(log_text))
@@ -914,7 +937,10 @@ async def do_build_and_sign(context, chat_id, status_msg, uid, mode, ks_name=Non
         shutil.rmtree(dist_dir, ignore_errors=True)
 
     await status_msg.edit_text("⏳ 1) جاري تجميع المشروع (apktool build)...")
-    ok, log_text = await run_cmd([JAVA_BIN, *JAVA_MEM_OPTS, "-jar", APKTOOL_JAR, "b", PROJECT_DIR, "-o", unsigned_apk, "-j", APKTOOL_JOBS])
+    ok, log_text = await run_cmd_with_heartbeat(
+        [JAVA_BIN, *JAVA_MEM_OPTS, "-jar", APKTOOL_JAR, "b", PROJECT_DIR, "-o", unsigned_apk, "-j", APKTOOL_JOBS],
+        status_msg, "⏳ 1) جاري تجميع المشروع (apktool build)...",
+    )
     if not ok or not os.path.isfile(unsigned_apk):
         await status_msg.edit_text("❌ فشل التجميع:\n" + tail_log(log_text), reply_markup=main_menu_kb())
         return
@@ -938,7 +964,7 @@ async def do_build_and_sign(context, chat_id, status_msg, uid, mode, ks_name=Non
             "--ksKeyPass", ks.get("keypass") or ks["storepass"],
         ]
 
-    ok, sign_log = await run_cmd(cmd)
+    ok, sign_log = await run_cmd_with_heartbeat(cmd, status_msg, "✅ تم التجميع.\n⏳ 2) جاري التوقيع (uber-apk-signer)...")
     try:
         os.remove(unsigned_apk)
     except Exception:
@@ -1614,7 +1640,10 @@ async def _handle_callback(query, context, uid, data, st):
         if os.path.isdir(PROJECT_DIR):
             shutil.rmtree(PROJECT_DIR, ignore_errors=True)
         msg = await query.edit_message_text("⏳ جاري فك الـ APK (apktool)...")
-        ok, log_text = await run_cmd([JAVA_BIN, *JAVA_MEM_OPTS, "-jar", APKTOOL_JAR, "d", APK_COPY_PATH, "-o", PROJECT_DIR, "-f", "-r", "-j", APKTOOL_JOBS])
+        ok, log_text = await run_cmd_with_heartbeat(
+            [JAVA_BIN, *JAVA_MEM_OPTS, "-jar", APKTOOL_JAR, "d", APK_COPY_PATH, "-o", PROJECT_DIR, "-f", "-r", "-j", APKTOOL_JOBS],
+            msg, "⏳ جاري فك الـ APK (apktool)...",
+        )
         try:
             os.remove(apk_path)
         except Exception:
@@ -1636,6 +1665,38 @@ async def _handle_callback(query, context, uid, data, st):
 
 
 # =============================================================================
+# معالج أخطاء عام — بدل ما أي استثناء يتبلع بصمت جوه المكتبة
+# =============================================================================
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    import traceback
+    tb = "".join(traceback.format_exception(None, context.error, context.error.__traceback__))
+    log.error(f"🔥 استثناء غير متوقع:\n{tb}")
+
+    short_tb = tail_log(tb, 1200)
+    admins = CFG.get("admin_ids") or []
+    for admin_id in admins:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=f"🔥 حصل خطأ غير متوقع في البوت (Instance: {INSTANCE_ID}):\n\n{short_tb}",
+            )
+        except Exception:
+            pass
+
+    # لو الخطأ جه من زرار، رجّع للمستخدم رد بدل ما يتعلق منتظر
+    try:
+        if update and getattr(update, "callback_query", None):
+            st = get_state(update.callback_query.from_user.id)
+            st["busy"] = False
+            await update.callback_query.message.reply_text(
+                "❌ حصل خطأ غير متوقع أثناء تنفيذ العملية. اتبعتلك التفاصيل لو انت أدمن.",
+                reply_markup=main_menu_kb(),
+            )
+    except Exception:
+        pass
+
+
+# =============================================================================
 # main
 # =============================================================================
 def main():
@@ -1650,6 +1711,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
 
     log.info(f"🚀 البوت شغال... (Instance: {INSTANCE_ID})")
     # drop_pending_updates=True: يمسح أي رسائل/كولباك متراكمة من نسخة قديمة عالقة،
