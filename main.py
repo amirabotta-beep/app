@@ -71,12 +71,21 @@ _LOCAL_JAVA_BIN = os.path.join(TOOLS_DIR, "jre", "bin", "java")
 JAVA_BIN = _LOCAL_JAVA_BIN if os.path.isfile(_LOCAL_JAVA_BIN) else "java"
 print(f"☕ Java path: {JAVA_BIN}  (محلي: {os.path.isfile(_LOCAL_JAVA_BIN)})")
 
-# ── إعدادات ذاكرة الجافا: مضبوطة لسيرفر محدود بـ 1GB RAM / 2 vCPU (Railway) ──
-# -Xmx640m  : سقف واضح للـ heap (يسيب مساحة للبوت نفسه وللنظام من أصل 1GB)
-# UseSerialGC: جامع قمامة أخف بكتير من الافتراضي (G1) على أجهزة قليلة الموارد
-JAVA_MEM_OPTS = ["-Xmx640m", "-XX:+UseSerialGC"]
-# عدد الـ threads اللي apktool يستخدمها، مطابق لعدد الـ vCPU الفعلي بدل القيمة الافتراضية (8)
-APKTOOL_JOBS = "2"
+# ── إعدادات ذاكرة الجافا: مضبوطة لسيرفر 1GB RAM / 2 vCPU (Railway) ──
+# بما إن عملية جافا واحدة بس بتشتغل في نفس الوقت (فك أو تجميع أو توقيع، مش
+# مع بعض - في قفل "busy" بيمنع التداخل)، أقصى استهلاك متوقع هو الـ heap ده
+# + overhead البايثون نفسه (~100-150MB) + حاجة بسيطة للنظام، فمسموح نزود
+# الـ heap شوية عن 640m السابقة عشان نقلل GC pauses ونسرّع التجميع.
+# لو رجعت مشكلة الـ OOM (كراش كامل للسيرفر)، رجّع Xmx لـ 640m أو أقل.
+JAVA_MEM_OPTS = [
+    "-Xms256m",                    # heap ابتدائي أكبر يقلل إعادة التحجيم أثناء التشغيل
+    "-Xmx800m",                    # سقف أعلى شوية من قبل (كان 640m) لتقليل الـ GC pauses
+    "-XX:+UseParallelGC",          # جامع قمامة بيستفيد من الـ 2 vCPU المتاحين (أسرع من Serial هنا)
+    "-XX:ParallelGCThreads=2",
+    "-XX:MaxMetaspaceSize=160m",   # سقف واضح للـ metaspace عشان ميكبرش من غير حدود
+]
+# عدد الـ threads اللي apktool يستخدمها = عدد الـ vCPU الفعلي المتاح (بدل ما يكون رقم ثابت)
+APKTOOL_JOBS = str(max(1, min(os.cpu_count() or 2, 2)))
 
 for _d in (TOOLS_DIR, WORKSPACE_DIR, KEYSTORES_DIR):
     os.makedirs(_d, exist_ok=True)
@@ -920,6 +929,10 @@ async def do_build_and_sign(context, chat_id, status_msg, uid, mode, ks_name=Non
     if not os.path.isdir(PROJECT_DIR):
         await status_msg.edit_text("❌ لا يوجد مشروع مفكوك حالياً.")
         return
+    problems = check_project_integrity(PROJECT_DIR)
+    if problems:
+        await status_msg.edit_text(project_integrity_report_text(problems), reply_markup=main_menu_kb())
+        return
     ok_jar, jar_msg = verify_jar_file(APKTOOL_JAR)
     if not ok_jar:
         await status_msg.edit_text(jar_msg)
@@ -1095,9 +1108,67 @@ async def deliver_signed_apk(context, chat_id, uid, destination: str):
 # =============================================================================
 # start_build_flow + show_keystores_for_build
 # =============================================================================
+def check_project_integrity(project_dir):
+    """
+    فحص سريع لسلامة المشروع المفكوك قبل محاولة التجميع، عشان لو المستخدم
+    عدّل/مسح حاجة يدوي جوه مجلد المشروع (زي حذف/تعديل smali أو الموارد)
+    نقدر نقوله بالظبط المشكلة فين على طول، بدل ما ننتظر apktool يفشل
+    بعد دقايق برسالة تقنية طويلة وغامضة.
+
+    بيرجّع list من رسائل المشاكل (فاضية = المشروع سليم ظاهريًا).
+    """
+    problems = []
+
+    if not os.path.isdir(project_dir):
+        return ["❌ مجلد المشروع نفسه مش موجود."]
+
+    manifest_path = os.path.join(project_dir, "AndroidManifest.xml")
+    if not os.path.isfile(manifest_path):
+        problems.append("• ملف AndroidManifest.xml مش موجود في مجلد المشروع (تم حذفه أو نقله؟).")
+    else:
+        try:
+            import xml.etree.ElementTree as ET
+            ET.parse(manifest_path)
+        except Exception as e:
+            problems.append(f"• AndroidManifest.xml تالف / XML غير صالح:\n   {e}")
+
+    apktool_yml = os.path.join(project_dir, "apktool.yml")
+    if not os.path.isfile(apktool_yml):
+        problems.append(
+            "• ملف apktool.yml مش موجود. ده ملف الميتاداتا اللي apktool بيحتاجه\n"
+            "  عشان يعرف يجمّع المشروع تاني - من غيره التجميع مستحيل ينجح."
+        )
+
+    smali_dirs = sorted(
+        d for d in glob.glob(os.path.join(project_dir, "smali*"))
+        if os.path.isdir(d)
+    )
+    if not smali_dirs:
+        problems.append("• مفيش أي مجلد smali جوه المشروع (الكود المفكوك مش موجود أو اتمسح بالكامل).")
+    else:
+        empty_dirs = [os.path.basename(d) for d in smali_dirs if not any(os.scandir(d))]
+        if empty_dirs:
+            problems.append(f"• المجلدات دي فاضية بالكامل: {', '.join(empty_dirs)}.")
+
+    return problems
+
+
+def project_integrity_report_text(problems):
+    return (
+        "🚫 المشروع فيه مشاكل واضحة قبل ما نحاول نجمّعه:\n\n"
+        + "\n".join(problems)
+        + "\n\n💡 لو انت عدّلت أو مسحت حاجة يدوي جوه مجلد المشروع، رجّعها زي ما كانت.\n"
+          "أو ابعت ملف الـ APK الأصلي تاني وخليه يتفك من جديد."
+    )
+
+
 async def start_build_flow(query, uid):
     if not os.path.isdir(PROJECT_DIR):
         await query.edit_message_text("❌ لا يوجد مشروع مفكوك حالياً. ابعت ملف APK أولاً.", reply_markup=main_menu_kb())
+        return
+    problems = check_project_integrity(PROJECT_DIR)
+    if problems:
+        await query.edit_message_text(project_integrity_report_text(problems), reply_markup=main_menu_kb())
         return
     ok_jar, jar_msg = verify_jar_file(UBER_SIGNER_JAR)
     if not ok_jar:
