@@ -812,8 +812,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st["download_page_url"] = text
         st["await"] = "download_direct_url"
         await update.message.reply_text(
-            "✅ تمام!\n\nالخطوة 2️⃣: أرسل رابط التنزيل المباشر\n"
-            "(الرابط اللي فيه token= والملف .apk)"
+            "✅ تمام!\n\n"
+            "الخطوة 2️⃣: انسخ رابط التنزيل المباشر بتاع ملف الـ APK نفسه وابعته هنا.\n"
+            "(ملاحظة: مش مطلوب منك أي توكن بوت أو GitHub — الرابط ده بس بيحتوي "
+            "كلمة token= جواه كجزء من رابط الموقع، ده طبيعي وجزء من الرابط.)"
         )
         return
 
@@ -1610,7 +1612,18 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     log.info("🚀 البوت شغال...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # drop_pending_updates=True: يمسح أي رسائل/كولباك متراكمة من نسخة قديمة عالقة
+    # قبل ما يبدأ يستقبل رسائل جديدة، عشان نقلل أثر أي نسخة تانية كانت شغالة بالغلط.
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    except Exception as e:
+        if "Conflict" in str(e) or "terminated by other getUpdates" in str(e):
+            log.error(
+                "🚨 تعارض: في نسخة تانية من البوت شغالة بنفس التوكن دلوقتي!\n"
+                "روح Railway → Deployments وتأكد إن مفيش أكتر من deployment/replica شغال،\n"
+                "أو إنك مش مشغّل نسخة تانية محليًا على جهازك في نفس الوقت."
+            )
+        raise
 
 
 if __name__ == "__main__":
