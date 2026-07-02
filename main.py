@@ -1258,6 +1258,7 @@ def main_menu_kb():
         [InlineKeyboardButton("🔑 إدارة شهادات التوقيع", callback_data="menu_keystores")],
         [InlineKeyboardButton("🐙 تحديث توكن GitHub", callback_data="menu_update_github_token")],
         [InlineKeyboardButton("🆔 تحديث User UID", callback_data="menu_update_owner_uid")],
+        [InlineKeyboardButton("📧 تحديث بيانات دخول Firebase", callback_data="menu_update_firebase_login")],
         [InlineKeyboardButton("☕ فحص/تحميل Java", callback_data="menu_check_java")],
         [InlineKeyboardButton("🛠 فحص/تحميل أدوات APK", callback_data="menu_check_tools")],
         [InlineKeyboardButton("🗑 حذف المشروع الحالي", callback_data="menu_delete_project")],
@@ -1520,6 +1521,98 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ تم حفظ User UID بنجاح:\n`{new_uid}`\n\n"
             "هيتضاف تلقائيًا كحقل \"ownerUid\" في أي تطبيق تنشره من دلوقتي.",
+            reply_markup=main_menu_kb(),
+        )
+        return
+
+    if awaiting == "new_firebase_email":
+        new_email = text.strip()
+        if "@" not in new_email or " " in new_email:
+            await update.message.reply_text("❌ ده مش شكل إيميل سليم. ابعت الإيميل تاني:")
+            return
+        st["_firebase_email_temp"] = new_email
+        st["await"] = "new_firebase_password"
+        await update.message.reply_text(
+            f"📧 الإيميل: `{new_email}`\n\n"
+            "دلوقتي ابعت الباسورد بتاع نفس الحساب.\n"
+            "⚠️ همسح رسالتك اللي فيها الباسورد فورًا من الشات بعد الحفظ.",
+        )
+        return
+
+    if awaiting == "new_firebase_password":
+        new_password = text
+        new_email    = st.get("_firebase_email_temp", "").strip()
+        st.pop("await", None)
+        st.pop("_firebase_email_temp", None)
+
+        # امسح رسالة المستخدم اللي فيها الباسورد فورًا — أمان.
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        if not new_email:
+            await context.bot.send_message(
+                update.effective_chat.id,
+                "❌ حصل خطأ: مفيش إيميل محفوظ من الخطوة اللي فاتت. ابدأ تاني من القائمة.",
+                reply_markup=main_menu_kb(),
+            )
+            return
+
+        status_msg = await context.bot.send_message(
+            update.effective_chat.id, "⏳ جاري التحقق من بيانات الدخول..."
+        )
+
+        # فحص حقيقي: تسجيل دخول تجريبي بنفس بيانات Identity Toolkit REST
+        # المستخدمة فعليًا في نشر التطبيقات، عشان نتأكد إنها شغالة قبل الحفظ.
+        api_key = CFG.get("firebase_api_key", "")
+        try:
+            check = requests.post(
+                f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={api_key}",
+                json={"email": new_email, "password": new_password, "returnSecureToken": True},
+                timeout=20,
+            )
+        except Exception as e:
+            await status_msg.edit_text(f"❌ فشل الاتصال بـ Firebase للتحقق من البيانات:\n{e}")
+            return
+
+        if not check.ok:
+            try:
+                err = check.json().get("error", {}).get("message", check.text)
+            except Exception:
+                err = check.text
+            await status_msg.edit_text(
+                f"❌ تسجيل الدخول فشل ({err}).\n"
+                "اتأكد إن الإيميل والباسورد صح، وإن الحساب ده متسجّل فعلاً في "
+                "Firebase Authentication، وحاول تاني من القائمة.",
+                reply_markup=main_menu_kb(),
+            )
+            return
+
+        # البيانات شغالة فعلاً → احفظها في config.json
+        try:
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+            else:
+                existing = dict(DEFAULT_CONFIG)
+        except Exception:
+            existing = dict(DEFAULT_CONFIG)
+        existing["firebase_admin_email"]    = new_email
+        existing["firebase_admin_password"] = new_password
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+        CFG["firebase_admin_email"]    = new_email
+        CFG["firebase_admin_password"] = new_password
+
+        # نفضّي الكاش القديم لأي توكن دخول سابق، عشان أول عملية نشر بعد كده
+        # تستخدم الحساب الجديد فورًا بدل ما تفضل شغالة على توكن الحساب القديم.
+        _FB_TOKEN_CACHE["id_token"]      = None
+        _FB_TOKEN_CACHE["refresh_token"] = None
+        _FB_TOKEN_CACHE["expires_at"]    = 0
+
+        await status_msg.edit_text(
+            "✅ تم حفظ بيانات دخول Firebase الجديدة والتحقق منها بنجاح.",
             reply_markup=main_menu_kb(),
         )
         return
@@ -2986,6 +3079,18 @@ async def _handle_callback(query, context, uid, data, st):
             "(هتلاقيه في Firebase Console → Authentication → Users)، مثال:\n"
             "`QtoWqaDrgQUc0cuyERXLjXKRlj72`\n\n"
             "ده هيتحفظ ويُستخدم تلقائيًا كحقل \"ownerUid\" في كل تطبيق تنشره."
+        )
+
+    # ── تحديث بيانات دخول Firebase (إيميل + باسورد) ──
+    elif data == "menu_update_firebase_login":
+        st["await"] = "new_firebase_email"
+        st.pop("_firebase_email_temp", None)
+        current_email = CFG.get("firebase_admin_email", "").strip() or "غير محدد"
+        await query.edit_message_text(
+            "📧 تحديث بيانات دخول Firebase\n\n"
+            f"الإيميل الحالي: `{current_email}`\n\n"
+            "ابعت إيميل حساب الأدمن في Firebase Authentication دلوقتي "
+            "(نفس الحساب اللي مضاف كأدمن في قواعد أمان Firestore عندك)."
         )
 
     # ── تنزيل من رابط ──
