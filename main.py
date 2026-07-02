@@ -1098,6 +1098,7 @@ def main_menu_kb():
         [InlineKeyboardButton("📥 تنزيل APK من رابط", callback_data="menu_download_url")],
         [InlineKeyboardButton("🖊 تجميع وتوقيع", callback_data="menu_build")],
         [InlineKeyboardButton("🔍 بحث واستبدال smali", callback_data="menu_search")],
+        [InlineKeyboardButton("📄 بحث باسم ملف واستبداله", callback_data="menu_search_filename")],
         [InlineKeyboardButton("📦 نقل classes.zip", callback_data="menu_classes")],
         [InlineKeyboardButton("🔑 إدارة شهادات التوقيع", callback_data="menu_keystores")],
         [InlineKeyboardButton("🐙 تحديث توكن GitHub", callback_data="menu_update_github_token")],
@@ -1194,6 +1195,26 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st["new_ks_path"] = dest
         st["await"]       = "keystore_alias"
         await update.message.reply_text("✅ تم استلام ملف الـ keystore.\n✍️ دلوقتي اكتب الـ Alias:")
+        return
+
+    if st.get("await") == "filename_replace_upload":
+        target_rel = st.get("filename_replace_target")
+        if not target_rel:
+            st.pop("await", None)
+            await update.message.reply_text("❌ حصل خطأ، جرب تاني من القائمة.", reply_markup=main_menu_kb())
+            return
+        tmp_path = os.path.join(WORKSPACE_DIR, f"upload_{random_string(6)}_{doc.file_name or 'file'}")
+        f = await doc.get_file()
+        await f.download_to_drive(tmp_path)
+        result = await asyncio.to_thread(replace_file_sync, PROJECT_DIR, target_rel, tmp_path)
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        st.pop("await", None)
+        st.pop("filename_replace_target", None)
+        st.pop("filename_matches", None)
+        await update.message.reply_text(result, reply_markup=main_menu_kb())
         return
 
     if name.endswith(".apk"):
@@ -1394,12 +1415,14 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if awaiting == "search_replace_with":
         st["replace_text"] = text
         st.pop("await", None)
+        target = st.get("search_target_file")
+        target_note = f"في الملف:\n📄 {target}" if target else "في كل الملفات المطابقة"
         kb = [[
             InlineKeyboardButton("✅ تأكيد الاستبدال", callback_data="confirm_replace"),
             InlineKeyboardButton("❌ إلغاء",           callback_data="back_main"),
         ]]
         await update.message.reply_text(
-            f"استبدال:\n\"{st.get('search_text','')}\"    \nبـ:\n\"{text}\"\n\nفي كل ملفات smali. تأكيد؟",
+            f"استبدال:\n\"{st.get('search_text','')}\"    \nبـ:\n\"{text}\"\n\n{target_note}. تأكيد؟",
             reply_markup=InlineKeyboardMarkup(kb),
         )
         return
@@ -1407,14 +1430,21 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if awaiting == "search_insert_with":
         st["insert_text"] = text
         st.pop("await", None)
+        target = st.get("search_target_file")
+        target_note = f"في الملف:\n📄 {target}" if target else "في كل الملفات المطابقة"
         kb = [[
             InlineKeyboardButton("✅ تأكيد الإضافة", callback_data="confirm_insert"),
             InlineKeyboardButton("❌ إلغاء",         callback_data="back_main"),
         ]]
         await update.message.reply_text(
-            f"عند كل سطر فيه:\n\"{st.get('search_text','')}\"\nهيتم إضافة سطر جديد تحته:\n\"{text}\"\n\nتأكيد؟",
+            f"عند كل سطر فيه:\n\"{st.get('search_text','')}\"\nهيتم إضافة سطر جديد تحته:\n\"{text}\"\n\n{target_note}. تأكيد؟",
             reply_markup=InlineKeyboardMarkup(kb),
         )
+        return
+
+    if awaiting == "search_filename_keyword":
+        st.pop("await", None)
+        await handle_filename_search_result(update, st, text)
         return
 
     await update.message.reply_text("اختار من القائمة:", reply_markup=main_menu_kb())
@@ -1744,8 +1774,59 @@ def do_search_only_sync(project_dir, search_text):
     return f"✅ النص موجود: {total} نتيجة في {files_count} ملف.\n\n" + "\n".join(out_lines)
 
 
-def do_delete_sync(project_dir, search_text):
+def find_matching_smali_files(project_dir, search_text):
+    """يرجّع قائمة (المسار النسبي, عدد مرات التكرار) لكل ملف smali فيه النص،
+    مرتبة تنازليًا حسب عدد مرات التكرار. تُستخدم عشان نسمح للمستخدم يحدد
+    ملف بعينه بدل ما التعديل يطبق على كل الملفات المطابقة دفعة واحدة."""
     files = get_smali_files(project_dir)
+    results = []
+    for fpath in files:
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+        except Exception:
+            continue
+        count = content.count(search_text)
+        if count:
+            results.append((os.path.relpath(fpath, project_dir), count))
+    results.sort(key=lambda x: -x[1])
+    return results
+
+
+def find_files_by_name(project_dir, name_query):
+    """يبحث عن كل الملفات (أي نوع) اللي اسمها يحتوي على name_query
+    (بدون حساسية لحالة الأحرف)، ويرجّع المسارات النسبية مرتبة."""
+    q = (name_query or "").strip().lower()
+    if not q:
+        return []
+    matches = []
+    for root_dir, _, filenames in os.walk(project_dir):
+        for fn in filenames:
+            if q in fn.lower():
+                matches.append(os.path.relpath(os.path.join(root_dir, fn), project_dir))
+    matches.sort()
+    return matches
+
+
+def replace_file_sync(project_dir, target_rel, new_file_path):
+    """يستبدل محتوى ملف موجود داخل المشروع بملف جديد، مع الاحتفاظ
+    بنسخة احتياطية من الملف القديم قبل الاستبدال."""
+    target_path = os.path.join(project_dir, target_rel)
+    if not os.path.isfile(target_path):
+        return f"❌ الملف مش موجود:\n{target_rel}"
+    backup_dir  = os.path.join(project_dir, "_backup_before_filereplace")
+    backup_path = os.path.join(backup_dir, target_rel)
+    os.makedirs(os.path.dirname(backup_path), exist_ok=True)
+    try:
+        shutil.copy2(target_path, backup_path)
+    except Exception:
+        pass
+    shutil.copy2(new_file_path, target_path)
+    return f"✅ تم استبدال الملف بنجاح:\n{target_rel}\n💾 نسخة احتياطية من القديم في:\n{backup_dir}"
+
+
+def do_delete_sync(project_dir, search_text, target_rel=None):
+    files = [os.path.join(project_dir, target_rel)] if target_rel else get_smali_files(project_dir)
     total_removed, files_changed = 0, 0
     for fpath in files:
         try:
@@ -1763,8 +1844,8 @@ def do_delete_sync(project_dir, search_text):
     return f"✅ تم حذف {total_removed} سطر من {files_changed} ملف."
 
 
-def do_replace_sync(project_dir, search_text, replace_text):
-    files = get_smali_files(project_dir)
+def do_replace_sync(project_dir, search_text, replace_text, target_rel=None):
+    files = [os.path.join(project_dir, target_rel)] if target_rel else get_smali_files(project_dir)
     total, files_changed = 0, 0
     backup_dir = os.path.join(project_dir, "_backup_before_replace")
     for fpath in files:
@@ -1791,8 +1872,8 @@ def do_replace_sync(project_dir, search_text, replace_text):
     return f"✅ تم تنفيذ {total} استبدال في {files_changed} ملف.\n💾 نسخة احتياطية في:\n{backup_dir}"
 
 
-def do_insert_after_sync(project_dir, search_text, insert_text):
-    files = get_smali_files(project_dir)
+def do_insert_after_sync(project_dir, search_text, insert_text, target_rel=None):
+    files = [os.path.join(project_dir, target_rel)] if target_rel else get_smali_files(project_dir)
     total, files_changed = 0, 0
     backup_dir = os.path.join(project_dir, "_backup_before_insert")
     for fpath in files:
@@ -1848,26 +1929,100 @@ async def handle_search_action(query, context, st, action):
         await context.bot.send_message(query.message.chat_id, "📋 القائمة الرئيسية:", reply_markup=main_menu_kb())
         return
 
+    # للحذف/الاستبدال/الإضافة: لو النص ده ظاهر في أكتر من ملف smali، نوقف
+    # ونسأل المستخدم يحدد ملف بعينه بدل ما التعديل يطبق على كل الملفات
+    # المطابقة دفعة واحدة (ده اللي كان بيحصل قبل كده).
+    st.pop("search_target_file", None)
+    await query.edit_message_text("⏳ جاري تحديد الملفات المطابقة...")
+    matches = await asyncio.to_thread(find_matching_smali_files, PROJECT_DIR, search_text)
+    if not matches:
+        await query.edit_message_text("❌ النص غير موجود في أي ملف smali.", reply_markup=main_menu_kb())
+        return
+
+    if len(matches) == 1:
+        st["search_target_file"] = matches[0][0]
+        await proceed_search_action(query, st, action)
+        return
+
+    st["file_matches"] = matches
+    rows = []
+    for idx, (rel, count) in enumerate(matches[:30]):
+        rows.append([InlineKeyboardButton(f"📄 {rel} ({count})", callback_data=f"fmpick:{action}:{idx}")])
+    rows.append([InlineKeyboardButton("📁 كل الملفات المطابقة", callback_data=f"fmpick:{action}:all")])
+    rows.append([InlineKeyboardButton("⬅️ رجوع", callback_data="back_main")])
+    extra = "" if len(matches) <= 30 else f"\n(بيتم عرض أول 30 من {len(matches)} ملف)"
+    await query.edit_message_text(
+        f"🔎 النص:\n\"{search_text}\"\nموجود في {len(matches)} ملف.{extra}\n\n"
+        "اختار الملف اللي عايز تشتغل عليه، أو اختار كل الملفات:",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def proceed_search_action(query, st, action):
+    """يكمّل خطوة الحذف/الاستبدال/الإضافة بعد ما اتحدد ملف معيّن (أو كل الملفات)."""
+    search_text = st.get("search_text", "")
+    target      = st.get("search_target_file")
+    target_note = f"\n📄 في الملف: {target}" if target else "\n📁 في كل الملفات المطابقة"
+
     if action == "search_delete":
         kb = [[
             InlineKeyboardButton("✅ تأكيد الحذف", callback_data="confirm_delete"),
             InlineKeyboardButton("❌ إلغاء",       callback_data="back_main"),
         ]]
         await query.edit_message_text(
-            f"⚠️ هيتم حذف كل سطر فيه:\n\"{search_text}\"\nمن كل ملفات smali.\nتأكيد؟",
+            f"⚠️ هيتم حذف كل سطر فيه:\n\"{search_text}\"{target_note}\nتأكيد؟",
             reply_markup=InlineKeyboardMarkup(kb),
         )
         return
 
     if action == "search_replace":
         st["await"] = "search_replace_with"
-        await query.edit_message_text(f"النص المطلوب استبداله:\n\"{search_text}\"\n\n✍️ اكتب النص البديل:")
+        await query.edit_message_text(
+            f"النص المطلوب استبداله:\n\"{search_text}\"{target_note}\n\n✍️ اكتب النص البديل:"
+        )
         return
 
     if action == "search_insert":
         st["await"] = "search_insert_with"
-        await query.edit_message_text(f"عند كل سطر فيه:\n\"{search_text}\"\n\n✍️ اكتب النص اللي عايز تضيفه تحته:")
+        await query.edit_message_text(
+            f"عند كل سطر فيه:\n\"{search_text}\"{target_note}\n\n✍️ اكتب النص اللي عايز تضيفه تحته:"
+        )
         return
+
+
+# =============================================================================
+# البحث باسم الملف واستبداله
+# =============================================================================
+async def start_search_filename_flow(query, st):
+    if not os.path.isdir(PROJECT_DIR):
+        await query.edit_message_text("❌ لا يوجد مشروع مفكوك حالياً.", reply_markup=main_menu_kb())
+        return
+    st["await"] = "search_filename_keyword"
+    await query.edit_message_text(
+        "📄 اكتب اسم الملف أو جزء منه اللي عايز تدور عليه في كل ملفات المشروع (مثلاً: pk.smali):"
+    )
+
+
+async def handle_filename_search_result(update, st, name_query):
+    matches = await asyncio.to_thread(find_files_by_name, PROJECT_DIR, name_query)
+    if not matches:
+        await update.message.reply_text(
+            f"❌ مفيش أي ملف اسمه بيحتوي على:\n\"{name_query}\"",
+            reply_markup=main_menu_kb(),
+        )
+        return
+
+    st["filename_matches"] = matches
+    rows = []
+    for idx, rel in enumerate(matches[:30]):
+        rows.append([InlineKeyboardButton(f"📄 {rel}", callback_data=f"fnpick:{idx}")])
+    rows.append([InlineKeyboardButton("⬅️ رجوع", callback_data="back_main")])
+    extra = "" if len(matches) <= 30 else f"\n(بيتم عرض أول 30 من {len(matches)} نتيجة)"
+    await update.message.reply_text(
+        f"🔍 لقيت {len(matches)} ملف بيطابق:\n\"{name_query}\"{extra}\n\n"
+        "اختار الملف اللي عايز تستبدله:",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
 
 
 # =============================================================================
@@ -2158,20 +2313,50 @@ async def _handle_callback(query, context, uid, data, st):
         await start_search_flow(query, st)
     elif data in ("search_replace", "search_insert", "search_delete", "search_only"):
         await handle_search_action(query, context, st, data)
+    elif data.startswith("fmpick:"):
+        _, action, sel = data.split(":", 2)
+        matches = st.get("file_matches", [])
+        if sel == "all":
+            st["search_target_file"] = None
+        else:
+            idx = int(sel)
+            if idx >= len(matches):
+                await query.edit_message_text("❌ حصل خطأ، جرب تاني من القائمة.", reply_markup=main_menu_kb())
+                return
+            st["search_target_file"] = matches[idx][0]
+        await proceed_search_action(query, st, action)
     elif data == "confirm_delete":
         await query.edit_message_text("⏳ جاري الحذف...")
-        result = await asyncio.to_thread(do_delete_sync, PROJECT_DIR, st.get("search_text", ""))
+        result = await asyncio.to_thread(
+            do_delete_sync, PROJECT_DIR, st.get("search_text", ""), st.get("search_target_file")
+        )
         await query.edit_message_text(result, reply_markup=main_menu_kb())
     elif data == "confirm_replace":
         await query.edit_message_text("⏳ جاري الاستبدال...")
         result = await asyncio.to_thread(
-            do_replace_sync, PROJECT_DIR, st.get("search_text", ""), st.get("replace_text", "")
+            do_replace_sync, PROJECT_DIR, st.get("search_text", ""), st.get("replace_text", ""),
+            st.get("search_target_file"),
         )
         await query.edit_message_text(result, reply_markup=main_menu_kb())
+
+    # ── بحث باسم ملف واستبداله ──
+    elif data == "menu_search_filename":
+        await start_search_filename_flow(query, st)
+    elif data.startswith("fnpick:"):
+        idx = int(data.split(":", 1)[1])
+        matches = st.get("filename_matches", [])
+        if idx >= len(matches):
+            await query.edit_message_text("❌ حصل خطأ، جرب تاني من القائمة.", reply_markup=main_menu_kb())
+            return
+        target_rel = matches[idx]
+        st["filename_replace_target"] = target_rel
+        st["await"] = "filename_replace_upload"
+        await query.edit_message_text(f"📄 هيتم استبدال:\n{target_rel}\n\n📤 ابعت الملف البديل دلوقتي.")
     elif data == "confirm_insert":
         await query.edit_message_text("⏳ جاري الإضافة...")
         result = await asyncio.to_thread(
-            do_insert_after_sync, PROJECT_DIR, st.get("search_text", ""), st.get("insert_text", "")
+            do_insert_after_sync, PROJECT_DIR, st.get("search_text", ""), st.get("insert_text", ""),
+            st.get("search_target_file"),
         )
         await query.edit_message_text(result, reply_markup=main_menu_kb())
 
