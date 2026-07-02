@@ -146,6 +146,16 @@ DEFAULT_CONFIG = {
     "github_repo"    : "",          # مثال: "myuser/my-app"
     "github_key_path": "",          # مسار ملف .pem لو محتاجه (اختياري)
     "release_counter": 0,           # عداد محلي لرقم الإصدار — بيزيد واحد بعد كل رفع ناجح
+    # ── Firebase (نشر التطبيقات على الموقع) ──────────────────────────────────
+    # apiKey و projectId دول عموميين أصلاً (موجودين جوه كود صفحة الأدمن نفسها
+    # اللي شغالة في المتصفح)، فمفيش مشكلة إنهم يكونوا هنا. اللي لازم تحطه
+    # انت بنفسك (ماتبعتهوش هنا في الشات): firebase_admin_email/password —
+    # حساب أدمن حقيقي (إيميل + باسورد) متسجل في Firebase Authentication
+    # ومضاف في قايمة الأدمن (ALLOWED_ADMINS) وفي قواعد أمان Firestore.
+    "firebase_api_key"        : "AIzaSyDqiO6lxMfbsBGbTln1TwDnZP5VpKrbYIw",
+    "firebase_project_id"     : "volt-tech-814a5",
+    "firebase_admin_email"    : "",
+    "firebase_admin_password" : "",
 }
 
 
@@ -167,6 +177,8 @@ def load_config():
     # فاضي من الأسرار الحقيقية وميبقاش خطر لو اترفع لـ Git بالغلط.
     cfg["bot_token"]    = os.environ.get("BOT_TOKEN", cfg.get("bot_token", ""))
     cfg["github_token"] = os.environ.get("GITHUB_TOKEN", cfg.get("github_token", ""))
+    cfg["firebase_admin_email"]    = os.environ.get("FIREBASE_ADMIN_EMAIL", cfg.get("firebase_admin_email", ""))
+    cfg["firebase_admin_password"] = os.environ.get("FIREBASE_ADMIN_PASSWORD", cfg.get("firebase_admin_password", ""))
 
     return cfg
 
@@ -181,7 +193,7 @@ def save_config(cfg):
         if os.path.exists(CONFIG_PATH):
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 existing = json.load(f)
-            for secret_key in ("bot_token", "github_token"):
+            for secret_key in ("bot_token", "github_token", "firebase_admin_email", "firebase_admin_password"):
                 if secret_key in existing:
                     to_write[secret_key] = existing[secret_key]
     except Exception:
@@ -1091,6 +1103,140 @@ def github_upload_sync(apk_path: str, apk_original_name: str) -> tuple[bool, str
 
 
 # =============================================================================
+# Firebase (نشر تطبيق على الموقع) — عبر REST API، بدون الحاجة لـ Service Account
+# ─────────────────────────────────────────────────────────────────────────
+# البوت بيسجّل دخول بإيميل/باسورد حساب أدمن حقيقي (عبر Identity Toolkit REST)
+# وياخد idToken، وبعدين يستخدمه عشان يكتب مستند جديد في مجموعة "apps" على
+# Firestore عبر REST API — بنفس منطق دالة saveApp() في صفحة الأدمن بالظبط.
+#
+# ملحوظة مهمة: "Authorized domains" في إعدادات Firebase Authentication بتتحكم
+# بس في تسجيل الدخول عبر المتصفح (Google/OAuth Redirect)، ومالهاش أي علاقة
+# بطلبات REST بيسجل بيها سيرفر بايثون دخول بإيميل/باسورد — فمفيش داعي نلمسها.
+# اللي فعلاً بيحدد صلاحية الكتابة هو حساب الأدمن نفسه (لازم يكون الـ UID
+# بتاعه مضاف في قواعد أمان Firestore عندك على أساس إنه أدمن).
+# =============================================================================
+_FB_TOKEN_CACHE = {"id_token": None, "refresh_token": None, "expires_at": 0}
+
+
+def _firebase_sign_in_sync():
+    api_key  = CFG.get("firebase_api_key", "")
+    email    = CFG.get("firebase_admin_email", "")
+    password = CFG.get("firebase_admin_password", "")
+    if not api_key or not email or not password:
+        raise RuntimeError(
+            "بيانات Firebase ناقصة في config.json — لازم تحط firebase_admin_email "
+            "و firebase_admin_password (وfirebase_api_key موجود افتراضيًا)."
+        )
+    url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={api_key}"
+    r = requests.post(url, json={
+        "email": email, "password": password, "returnSecureToken": True,
+    }, timeout=30)
+    if not r.ok:
+        try:
+            err = r.json().get("error", {}).get("message", r.text)
+        except Exception:
+            err = r.text
+        raise RuntimeError(f"فشل تسجيل الدخول لـ Firebase: {err}")
+    data = r.json()
+    _FB_TOKEN_CACHE["id_token"]      = data["idToken"]
+    _FB_TOKEN_CACHE["refresh_token"] = data["refreshToken"]
+    _FB_TOKEN_CACHE["expires_at"]    = time.time() + int(data.get("expiresIn", "3600")) - 60
+    return _FB_TOKEN_CACHE["id_token"]
+
+
+def _firebase_refresh_sync():
+    api_key = CFG.get("firebase_api_key", "")
+    rtoken  = _FB_TOKEN_CACHE.get("refresh_token")
+    if not rtoken:
+        return _firebase_sign_in_sync()
+    url = f"https://securetoken.googleapis.com/v1/token?key={api_key}"
+    r = requests.post(url, data={
+        "grant_type": "refresh_token", "refresh_token": rtoken,
+    }, timeout=30)
+    if not r.ok:
+        # الـ refresh token نفسه ممكن يكون انتهى/اتلغى — نرجع نسجل دخول من الأول
+        return _firebase_sign_in_sync()
+    data = r.json()
+    _FB_TOKEN_CACHE["id_token"]      = data["id_token"]
+    _FB_TOKEN_CACHE["refresh_token"] = data["refresh_token"]
+    _FB_TOKEN_CACHE["expires_at"]    = time.time() + int(data.get("expires_in", "3600")) - 60
+    return _FB_TOKEN_CACHE["id_token"]
+
+
+def _firebase_get_id_token_sync():
+    if _FB_TOKEN_CACHE["id_token"] and time.time() < _FB_TOKEN_CACHE["expires_at"]:
+        return _FB_TOKEN_CACHE["id_token"]
+    if _FB_TOKEN_CACHE["refresh_token"]:
+        return _firebase_refresh_sync()
+    return _firebase_sign_in_sync()
+
+
+def _to_firestore_value(v):
+    """يحوّل قيمة بايثون لصيغة Firestore REST API."""
+    if v is None:
+        return {"nullValue": None}
+    if isinstance(v, bool):
+        return {"booleanValue": v}
+    if isinstance(v, int):
+        return {"integerValue": str(v)}
+    if isinstance(v, float):
+        return {"doubleValue": v}
+    if isinstance(v, dict):
+        return {"mapValue": {"fields": {k: _to_firestore_value(v2) for k, v2 in v.items()}}}
+    if isinstance(v, (list, tuple)):
+        return {"arrayValue": {"values": [_to_firestore_value(x) for x in v]}}
+    return {"stringValue": str(v)}
+
+
+def firestore_add_document_sync(collection_name: str, data: dict) -> tuple[bool, str]:
+    """يضيف مستند جديد لمجموعة معيّنة في Firestore عبر REST API، ويرجع (نجاح, رسالة/آيدي)."""
+    try:
+        id_token = _firebase_get_id_token_sync()
+    except Exception as e:
+        return False, f"❌ فشل تسجيل الدخول لـ Firebase:\n{e}"
+
+    project_id = CFG.get("firebase_project_id", "")
+    url = (
+        f"https://firestore.googleapis.com/v1/projects/{project_id}"
+        f"/databases/(default)/documents/{collection_name}"
+    )
+    fields = {k: _to_firestore_value(v) for k, v in data.items()}
+    try:
+        r = requests.post(
+            url,
+            headers={"Authorization": f"Bearer {id_token}"},
+            json={"fields": fields},
+            timeout=30,
+        )
+    except Exception as e:
+        return False, f"❌ خطأ في الاتصال بـ Firestore:\n{e}"
+
+    if r.status_code == 401:
+        # الـ token ممكن يكون اتلغى فجأة — نجرب مرة واحدة تاني بعد تسجيل دخول جديد
+        try:
+            id_token = _firebase_sign_in_sync()
+            r = requests.post(
+                url,
+                headers={"Authorization": f"Bearer {id_token}"},
+                json={"fields": fields},
+                timeout=30,
+            )
+        except Exception as e:
+            return False, f"❌ فشل بعد إعادة تسجيل الدخول:\n{e}"
+
+    if not r.ok:
+        try:
+            err = r.json().get("error", {}).get("message", r.text)
+        except Exception:
+            err = r.text
+        return False, f"❌ فشل الحفظ في Firestore ({r.status_code}):\n{err}"
+
+    doc_name = r.json().get("name", "")
+    doc_id   = doc_name.rstrip("/").split("/")[-1] if doc_name else ""
+    return True, doc_id
+
+
+# =============================================================================
 # القائمة الرئيسية
 # =============================================================================
 def main_menu_kb():
@@ -1099,6 +1245,7 @@ def main_menu_kb():
         [InlineKeyboardButton("🖊 تجميع وتوقيع", callback_data="menu_build")],
         [InlineKeyboardButton("🔍 بحث واستبدال smali", callback_data="menu_search")],
         [InlineKeyboardButton("📄 بحث باسم ملف واستبداله", callback_data="menu_search_filename")],
+        [InlineKeyboardButton("📤 نشر تطبيق على الموقع", callback_data="menu_publish_app")],
         [InlineKeyboardButton("📦 نقل classes.zip", callback_data="menu_classes")],
         [InlineKeyboardButton("🔑 إدارة شهادات التوقيع", callback_data="menu_keystores")],
         [InlineKeyboardButton("🐙 تحديث توكن GitHub", callback_data="menu_update_github_token")],
@@ -1447,6 +1594,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_filename_search_result(update, st, text)
         return
 
+    if awaiting == "publish_field_text":
+        await handle_publish_text_input(update, context, st, text)
+        return
+
     await update.message.reply_text("اختار من القائمة:", reply_markup=main_menu_kb())
 
 
@@ -1604,20 +1755,20 @@ async def deliver_signed_apk(context, chat_id, uid, destination: str):
     else:  # both — نجح لو واحد منهم على الأقل نجح
         all_success = sent_telegram or sent_github
 
-    # ── تنظيف بس لو نجح كل المطلوب ──
+    # ── تنظيف الملفات المؤقتة بس لو نجح الرفع (نسيب مجلد المشروع نفسه،
+    # وهنسأل المستخدم بعدين يمسحه ولا لأ) ──
     if all_success:
         try:
             os.remove(out_apk)
         except Exception:
             pass
-        shutil.rmtree(PROJECT_DIR, ignore_errors=True)
         try:
             os.remove(APK_COPY_PATH)
         except Exception:
             pass
         st.pop("signed_apk_path",  None)
         st.pop("original_apk_name", None)
-        cleanup_note = "\n\n🧹 تم حذف ملفات المشروع تلقائياً."
+        cleanup_note = ""
     else:
         # فشل — اعرض زرار لإعادة المحاولة
         cleanup_note = "\n\n⚠️ المشروع والملف الموقّع لسه موجودين، تقدر تحاول تاني."
@@ -1642,11 +1793,24 @@ async def deliver_signed_apk(context, chat_id, uid, destination: str):
         st["active_upload_msg_id"] = sent.message_id
     else:
         st.pop("active_upload_msg_id", None)
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"{summary}{cleanup_note}",
-            reply_markup=main_menu_kb(),
-        )
+        # ── بعد نجاح الرفع مباشرة: نسأل المستخدم يمسح مجلد المشروع (اللي
+        # اتفك) دلوقتي ولا يسيبه — بدل ما كان بيتمسح تلقائي من غير سؤال ──
+        if os.path.isdir(PROJECT_DIR):
+            del_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🗑 امسح المشروع",  callback_data="delproj_after_upload:yes"),
+                InlineKeyboardButton("📂 سيبه موجود",   callback_data="delproj_after_upload:no"),
+            ]])
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"{summary}{cleanup_note}\n\n🗑 تمسح ملفات المشروع اللي اتفك دلوقتي ولا تسيبه؟",
+                reply_markup=del_kb,
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"{summary}{cleanup_note}",
+                reply_markup=main_menu_kb(),
+            )
 
     # نظّف حالة المستخدم لو نجح الرفع
     if all_success:
@@ -2026,6 +2190,318 @@ async def handle_filename_search_result(update, st, name_query):
 
 
 # =============================================================================
+# نشر تطبيق على الموقع (نفس حقول فورم "إضافة تطبيق" في صفحة الأدمن بالظبط)
+# =============================================================================
+# كل خطوة عبارة عن: key (اسم الحقل في Firestore) - prompt (السؤال) -
+# type (طريقة الإدخال) - required (إجباري ولا لأ). الأنواع المتاحة:
+#   text           → نص عادي (ابعت "-" للتخطي لو مش إجباري)
+#   float / int    → رقم
+#   choice         → أزرار اختيار من قايمة
+#   bool           → أزرار نعم/لا
+#   multiline_list → كل سطر عنصر في قايمة (لقطات الشاشة)
+#   list_loop      → رسالة لكل عنصر، وابعت "تم" لما تخلص (شروط التشغيل)
+#   json           → نص بصيغة JSON (تقييمات المستخدمين)
+PUBLISH_FIELDS = [
+    {"key": "name",       "prompt": "✍️ اسم التطبيق:",                              "type": "text",  "required": True},
+    {"key": "developer",  "prompt": "✍️ اسم المطور:",                                "type": "text",  "required": True},
+    {"key": "packageId",  "prompt": "📦 Package ID (مثال: com.whatsapp):",           "type": "text",  "required": False},
+    {"key": "category",   "prompt": "📂 التصنيف:", "type": "choice", "required": True, "choices": [
+        ("games", "🎮 ألعاب"), ("social", "💬 تواصل اجتماعي"), ("tools", "🔧 أدوات"),
+        ("education", "📚 تعليم"), ("health", "💪 صحة ولياقة"), ("finance", "💰 مالية"),
+    ]},
+    {"key": "icon",        "prompt": "🖼 رابط الأيقونة (URL):",                       "type": "text",  "required": False},
+    {"key": "directUrl",   "prompt": "🔗 رابط التنزيل المباشر:",                      "type": "text",  "required": True},
+    {"key": "rating",      "prompt": "⭐ التقييم (من 1 لـ 5، مثال: 4.3):",           "type": "float", "required": False},
+    {"key": "ratingCount", "prompt": "🔢 عدد التقييمات (مثال: 5000000):",            "type": "int",   "required": False},
+    {"key": "size",        "prompt": "📦 حجم التطبيق (مثال: 55 MB):",                "type": "text",  "required": False},
+    {"key": "installs",    "prompt": "📥 عدد التثبيتات (مثال: 1B+):",                "type": "text",  "required": False},
+    {"key": "description", "prompt": "📝 وصف التطبيق:",                              "type": "text",  "required": False},
+    {"key": "headerImage", "prompt": "🖼 رابط صورة الترويسة (Header Image):",         "type": "text",  "required": False},
+    {"key": "screenshots", "prompt": "📸 روابط لقطات الشاشة — كل رابط في سطر (حتى 8 روابط):", "type": "multiline_list", "required": False},
+    {"key": "version",        "prompt": "🔢 رقم الإصدار (مثال: 2.24.1):",            "type": "text", "required": False},
+    {"key": "androidVersion", "prompt": "🤖 أقل إصدار أندرويد مطلوب (مثال: 5.0):",   "type": "text", "required": False},
+    {"key": "contentRating", "prompt": "🔞 التصنيف العمري:", "type": "choice", "required": False, "choices": [
+        ("", "بدون"), ("Everyone", "Everyone (للجميع)"), ("Everyone 10+", "Everyone 10+"),
+        ("Teen", "Teen (13+)"), ("Mature 17+", "Mature 17+"),
+    ]},
+    {"key": "releaseDate",     "prompt": "📅 تاريخ الإصدار الأصلي (YYYY-MM-DD):",     "type": "text", "required": False},
+    {"key": "adSupported",     "prompt": "📢 يحتوي إعلانات؟",                         "type": "bool", "required": False},
+    {"key": "inAppPurchases",  "prompt": "💳 فيه مشتريات داخلية؟",                    "type": "bool", "required": False},
+    {"key": "conditions", "prompt": "⚠️ شروط التشغيل (تظهر للمستخدم قبل التنزيل):",   "type": "list_loop", "required": False},
+    {"key": "topReviews", "prompt": "💬 تقييمات المستخدمين بصيغة JSON، مثال:\n[{\"author\":\"أحمد\",\"rating\":5,\"text\":\"تطبيق رائع!\",\"date\":\"2024-03\"}]", "type": "json", "required": False},
+    {"key": "badge", "prompt": "🏷 الشارة:", "type": "choice", "required": False, "choices": [
+        ("", "بدون شارة"), ("new", "🆕 جديد"), ("hot", "🔥 رائج"),
+    ]},
+    {"key": "status", "prompt": "📊 حالة التطبيق:", "type": "choice", "required": False, "choices": [
+        ("active", "✅ نشط"), ("hidden", "🔒 مخفي"),
+    ]},
+    {"key": "featured",       "prompt": "⭐ يظهر كتطبيق مميز؟",                       "type": "bool", "required": False},
+    {"key": "seoTitle",       "prompt": "🔍 عنوان الصفحة في جوجل (SEO Title):",       "type": "text", "required": False},
+    {"key": "seoDescription", "prompt": "🔍 وصف الصفحة في جوجل (Meta Description، 120-160 حرف مثالي):", "type": "text", "required": False},
+    {"key": "seoSlug",        "prompt": "🔗 رابط الصفحة (SEO Slug)، مثال: whatsapp-download:", "type": "text", "required": False},
+]
+
+
+def _publish_default_icon(cat):
+    m = {"games": "🎮", "social": "💬", "tools": "🔧", "education": "📚", "health": "💪", "finance": "💰"}
+    return m.get(cat, "📱")
+
+
+def _publish_slugify(text_):
+    text_ = (text_ or "").strip().lower()
+    text_ = re.sub(r"\s+", "-", text_)
+    text_ = re.sub(r"[^a-z0-9\-]", "", text_)
+    return text_
+
+
+async def start_publish_flow(query, context, st):
+    st["publish_data"] = {}
+    st["publish_step"] = 0
+    st.pop("publish_list_temp", None)
+    await query.edit_message_text(
+        "📤 نشر تطبيق جديد على الموقع\n\n"
+        "هسألك بيانات التطبيق حقل حقل زي فورم الموقع بالظبط.\n"
+        "أي حقل مش إجباري تقدر تتخطاه بإرسال \"-\".\n\n"
+        "يلا نبدأ 👇"
+    )
+    await prompt_publish_step(context.bot, query.message.chat_id, st)
+
+
+async def prompt_publish_step(bot, chat_id, st):
+    step_idx = st.get("publish_step", 0)
+    if step_idx >= len(PUBLISH_FIELDS):
+        await finalize_publish(bot, chat_id, st)
+        return
+
+    step  = PUBLISH_FIELDS[step_idx]
+    stype = step["type"]
+    label = f"({step_idx + 1}/{len(PUBLISH_FIELDS)})"
+
+    if stype == "choice":
+        rows = [[InlineKeyboardButton(disp, callback_data=f"pub:{step_idx}:{cidx}")]
+                for cidx, (_, disp) in enumerate(step["choices"])]
+        st.pop("await", None)
+        await bot.send_message(chat_id, f"{label} {step['prompt']}", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if stype == "bool":
+        rows = [[
+            InlineKeyboardButton("✅ نعم", callback_data=f"pub:{step_idx}:1"),
+            InlineKeyboardButton("❌ لا",  callback_data=f"pub:{step_idx}:0"),
+        ]]
+        st.pop("await", None)
+        await bot.send_message(chat_id, f"{label} {step['prompt']}", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if stype == "list_loop":
+        st["publish_list_temp"] = []
+        st["await"] = "publish_field_text"
+        await bot.send_message(
+            chat_id,
+            f"{label} {step['prompt']}\n"
+            "(ابعت كل شرط في رسالة لوحده، وابعت \"تم\" لما تخلص، أو \"-\" لو مفيش شروط)"
+        )
+        return
+
+    skip_note = "" if step["required"] else "\n(ابعت \"-\" لو عايز تتخطاه)"
+    st["await"] = "publish_field_text"
+    await bot.send_message(chat_id, f"{label} {step['prompt']}{skip_note}")
+
+
+async def handle_publish_text_input(update, context, st, text):
+    step_idx = st.get("publish_step", 0)
+    if step_idx >= len(PUBLISH_FIELDS):
+        return
+    step  = PUBLISH_FIELDS[step_idx]
+    stype = step["type"]
+    bot   = context.bot
+    chat_id = update.effective_chat.id
+
+    if stype == "list_loop":
+        if text == "تم":
+            st["publish_data"][step["key"]] = st.pop("publish_list_temp", [])
+            st["publish_step"] = step_idx + 1
+            st.pop("await", None)
+            await prompt_publish_step(bot, chat_id, st)
+            return
+        if text == "-" and not st.get("publish_list_temp"):
+            st["publish_data"][step["key"]] = []
+            st["publish_step"] = step_idx + 1
+            st.pop("await", None)
+            await prompt_publish_step(bot, chat_id, st)
+            return
+        st.setdefault("publish_list_temp", []).append(text)
+        await update.message.reply_text(f"✅ اتضاف ({len(st['publish_list_temp'])}). ابعت شرط تاني أو اكتب \"تم\":")
+        return
+
+    if text == "-":
+        if step["required"]:
+            await update.message.reply_text("❌ الحقل ده إجباري، من فضلك اكتب قيمة:")
+            return
+        value = [] if stype == "multiline_list" else ("" if stype != "json" else None)
+    else:
+        if stype == "float":
+            try:
+                value = float(text.replace(",", "."))
+            except ValueError:
+                await update.message.reply_text("❌ اكتب رقم صحيح (مثال: 4.3) أو \"-\" للتخطي:")
+                return
+        elif stype == "int":
+            try:
+                value = int(re.sub(r"[^\d]", "", text) or "0")
+            except ValueError:
+                await update.message.reply_text("❌ اكتب رقم صحيح أو \"-\" للتخطي:")
+                return
+        elif stype == "multiline_list":
+            value = [l.strip() for l in text.split("\n") if l.strip()][:8]
+        elif stype == "json":
+            try:
+                value = json.loads(text)
+            except Exception as e:
+                await update.message.reply_text(f"❌ صيغة JSON غلط:\n{e}\nحاول تاني أو ابعت \"-\" للتخطي:")
+                return
+        else:
+            value = text
+
+    if value is not None:
+        st["publish_data"][step["key"]] = value
+    st["publish_step"] = step_idx + 1
+    st.pop("await", None)
+    await prompt_publish_step(bot, chat_id, st)
+
+
+async def handle_publish_choice_callback(query, context, st, step_idx, val_raw):
+    step = PUBLISH_FIELDS[step_idx]
+    if step["type"] == "bool":
+        value   = (val_raw == "1")
+        display = "✅ نعم" if value else "❌ لا"
+    else:
+        cidx = int(val_raw)
+        value, display = step["choices"][cidx][0], step["choices"][cidx][1]
+
+    st["publish_data"][step["key"]] = value
+    st["publish_step"] = step_idx + 1
+    await query.edit_message_text(f"{step['prompt']}\n➡️ {display}")
+    await prompt_publish_step(context.bot, query.message.chat_id, st)
+
+
+async def finalize_publish(bot, chat_id, st):
+    d   = st.get("publish_data", {})
+    name = d.get("name", "").strip()
+    dev  = d.get("developer", "").strip()
+    url_ = d.get("directUrl", "").strip()
+    cat  = d.get("category", "")
+
+    if not (name and dev and url_ and cat):
+        await bot.send_message(chat_id, "❌ حصل خطأ: في حقول إجبارية ناقصة. جرب تاني من القائمة.", reply_markup=main_menu_kb())
+        st.pop("publish_data", None)
+        st.pop("publish_step", None)
+        return
+
+    pkg = d.get("packageId", "").strip()
+    seo_slug = _publish_slugify(d.get("seoSlug", ""))
+    if not seo_slug:
+        seo_slug = pkg.replace(".", "-") if pkg else ""
+
+    now_iso = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+    app_data = {
+        "name": name,
+        "developer": dev,
+        "packageId": pkg,
+        "icon": d.get("icon", "").strip() or _publish_default_icon(cat),
+        "screenshots": d.get("screenshots", []) or [],
+        "directUrl": url_,
+        "downloadUrl": f"https://play.google.com/store/apps/details?id={pkg}" if pkg else "",
+        "category": cat,
+        "rating": d.get("rating", 0) or 0,
+        "ratingCount": d.get("ratingCount", 0) or 0,
+        "size": d.get("size", "").strip(),
+        "installs": d.get("installs", "").strip(),
+        "description": d.get("description", "").strip(),
+        "conditions": d.get("conditions", []) or [],
+        "badge": d.get("badge", ""),
+        "status": d.get("status") or "active",
+        "featured": bool(d.get("featured", False)),
+        "nameSearch": name.lower().split(),
+        "version": d.get("version", "").strip(),
+        "androidVersion": d.get("androidVersion", "").strip(),
+        "contentRating": d.get("contentRating", ""),
+        "releaseDate": d.get("releaseDate", "").strip(),
+        "adSupported": bool(d.get("adSupported", False)),
+        "inAppPurchases": bool(d.get("inAppPurchases", False)),
+        "headerImage": d.get("headerImage", "").strip(),
+        "seoTitle": d.get("seoTitle", "").strip(),
+        "seoDescription": d.get("seoDescription", "").strip(),
+        "seoSlug": seo_slug,
+        "downloads": 0,
+        "addedAt": {"__timestamp__": now_iso},
+        "updatedAt": {"__timestamp__": now_iso},
+    }
+    if d.get("topReviews"):
+        app_data["topReviews"] = d["topReviews"]
+
+    # نحوّل علامة الـ timestamp لصيغة Firestore الفعلية (بديل عن serverTimestamp
+    # اللي متاح بس في الـ SDK مش في REST create مباشرة)
+    def _fix_timestamps(obj):
+        if isinstance(obj, dict) and "__timestamp__" in obj:
+            return {"timestampValue": obj["__timestamp__"]}
+        return None
+
+    await bot.send_message(chat_id, "⏳ جاري حفظ التطبيق على الموقع...")
+
+    fields = {}
+    for k, v in app_data.items():
+        ts = _fix_timestamps(v) if isinstance(v, dict) else None
+        fields[k] = ts if ts else _to_firestore_value(v)
+
+    ok, result = await asyncio.to_thread(_publish_write_sync, fields)
+
+    st.pop("publish_data", None)
+    st.pop("publish_step", None)
+    st.pop("publish_list_temp", None)
+
+    if ok:
+        await bot.send_message(
+            chat_id,
+            f"✅ تم نشر التطبيق بنجاح على الموقع!\n📄 اسم: {name}\n🆔 معرّف المستند: `{result}`",
+            reply_markup=main_menu_kb(),
+        )
+    else:
+        await bot.send_message(chat_id, result, reply_markup=main_menu_kb())
+
+
+def _publish_write_sync(fields: dict) -> tuple[bool, str]:
+    """مثل firestore_add_document_sync لكن بياخد fields جاهزة بصيغة Firestore
+    (عشان نقدر نستبدل الـ timestamp بشكلها الصحيح قبل الإرسال)."""
+    try:
+        id_token = _firebase_get_id_token_sync()
+    except Exception as e:
+        return False, f"❌ فشل تسجيل الدخول لـ Firebase:\n{e}"
+
+    project_id = CFG.get("firebase_project_id", "")
+    url = f"https://firestore.googleapis.com/v1/projects/{project_id}/databases/(default)/documents/apps"
+    try:
+        r = requests.post(url, headers={"Authorization": f"Bearer {id_token}"}, json={"fields": fields}, timeout=30)
+        if r.status_code == 401:
+            id_token = _firebase_sign_in_sync()
+            r = requests.post(url, headers={"Authorization": f"Bearer {id_token}"}, json={"fields": fields}, timeout=30)
+    except Exception as e:
+        return False, f"❌ خطأ في الاتصال بـ Firestore:\n{e}"
+
+    if not r.ok:
+        try:
+            err = r.json().get("error", {}).get("message", r.text)
+        except Exception:
+            err = r.text
+        return False, f"❌ فشل الحفظ في Firestore ({r.status_code}):\n{err}"
+
+    doc_name = r.json().get("name", "")
+    doc_id   = doc_name.rstrip("/").split("/")[-1] if doc_name else ""
+    return True, doc_id
+
+
+# =============================================================================
 # تنزيل APK من رابط
 # =============================================================================
 async def download_apk_from_url(context, chat_id, uid, page_url: str, download_url: str):
@@ -2308,6 +2784,18 @@ async def _handle_callback(query, context, uid, data, st):
         await query.edit_message_text("⏳ جاري إعادة المحاولة...")
         await deliver_signed_apk(context, query.message.chat_id, uid, destination)
 
+    # ── مسح المشروع بعد نجاح الرفع (سؤال) ──
+    elif data.startswith("delproj_after_upload:"):
+        choice = data.split(":", 1)[1]
+        if choice == "yes":
+            shutil.rmtree(PROJECT_DIR, ignore_errors=True)
+            await query.edit_message_text("🧹 تم حذف مجلد المشروع.", reply_markup=main_menu_kb())
+        else:
+            await query.edit_message_text(
+                "📂 تمام، المشروع لسه موجود، تقدر تشتغل عليه تاني (بحث/استبدال، تجميع وتوقيع...) من القائمة.",
+                reply_markup=main_menu_kb(),
+            )
+
     # ── بحث واستبدال ──
     elif data == "menu_search":
         await start_search_flow(query, st)
@@ -2352,6 +2840,17 @@ async def _handle_callback(query, context, uid, data, st):
         st["filename_replace_target"] = target_rel
         st["await"] = "filename_replace_upload"
         await query.edit_message_text(f"📄 هيتم استبدال:\n{target_rel}\n\n📤 ابعت الملف البديل دلوقتي.")
+
+    # ── نشر تطبيق على الموقع ──
+    elif data == "menu_publish_app":
+        await start_publish_flow(query, context, st)
+    elif data.startswith("pub:"):
+        _, step_idx_s, val_raw = data.split(":", 2)
+        step_idx = int(step_idx_s)
+        if step_idx != st.get("publish_step", -1):
+            await query.edit_message_text("⚠️ الخطوة دي قديمة أو خلصت، جرب تاني من القائمة.", reply_markup=main_menu_kb())
+            return
+        await handle_publish_choice_callback(query, context, st, step_idx, val_raw)
     elif data == "confirm_insert":
         await query.edit_message_text("⏳ جاري الإضافة...")
         result = await asyncio.to_thread(
