@@ -43,6 +43,8 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.request import HTTPXRequest
+from telegram.error import TimedOut, NetworkError
 
 logging.basicConfig(
     level=logging.INFO,
@@ -156,6 +158,11 @@ DEFAULT_CONFIG = {
     "firebase_project_id"     : "volt-tech-814a5",
     "firebase_admin_email"    : "",
     "firebase_admin_password" : "",
+    # User UID بتاع حساب الأدمن في Firebase Authentication (مثلاً:
+    # QtoWqaDrgQUc0cuyERXLjXKRlj72) — بيتحفظ في التطبيقات المنشورة كحقل
+    # "ownerUid" عشان يتوافق مع قواعد أمان Firestore اللي بتتحقق من
+    # request.auth.uid. تقدر تحدّثه من زرار "🆔 تحديث User UID" في القائمة.
+    "firebase_owner_uid"      : "",
 }
 
 
@@ -179,6 +186,7 @@ def load_config():
     cfg["github_token"] = os.environ.get("GITHUB_TOKEN", cfg.get("github_token", ""))
     cfg["firebase_admin_email"]    = os.environ.get("FIREBASE_ADMIN_EMAIL", cfg.get("firebase_admin_email", ""))
     cfg["firebase_admin_password"] = os.environ.get("FIREBASE_ADMIN_PASSWORD", cfg.get("firebase_admin_password", ""))
+    cfg["firebase_owner_uid"]      = os.environ.get("FIREBASE_OWNER_UID", cfg.get("firebase_owner_uid", ""))
 
     return cfg
 
@@ -1249,6 +1257,7 @@ def main_menu_kb():
         [InlineKeyboardButton("📦 نقل classes.zip", callback_data="menu_classes")],
         [InlineKeyboardButton("🔑 إدارة شهادات التوقيع", callback_data="menu_keystores")],
         [InlineKeyboardButton("🐙 تحديث توكن GitHub", callback_data="menu_update_github_token")],
+        [InlineKeyboardButton("🆔 تحديث User UID", callback_data="menu_update_owner_uid")],
         [InlineKeyboardButton("☕ فحص/تحميل Java", callback_data="menu_check_java")],
         [InlineKeyboardButton("🛠 فحص/تحميل أدوات APK", callback_data="menu_check_tools")],
         [InlineKeyboardButton("🗑 حذف المشروع الحالي", callback_data="menu_delete_project")],
@@ -1479,6 +1488,38 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await status_msg.edit_text(
             "✅ تم حفظ توكن GitHub الجديد والتحقق منه بنجاح." + extra_note,
+            reply_markup=main_menu_kb(),
+        )
+        return
+
+    if awaiting == "new_owner_uid":
+        new_uid = text.strip()
+        st.pop("await", None)
+
+        if not new_uid or " " in new_uid or len(new_uid) < 6:
+            await update.message.reply_text(
+                "❌ ده مش شكل UID سليم (متوقع نص متصل بدون فراغات، ~28 حرف عادةً). "
+                "حاول تاني أو رجّع من القائمة الرئيسية.",
+                reply_markup=main_menu_kb(),
+            )
+            return
+
+        try:
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+            else:
+                existing = dict(DEFAULT_CONFIG)
+        except Exception:
+            existing = dict(DEFAULT_CONFIG)
+        existing["firebase_owner_uid"] = new_uid
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+        CFG["firebase_owner_uid"] = new_uid
+
+        await update.message.reply_text(
+            f"✅ تم حفظ User UID بنجاح:\n`{new_uid}`\n\n"
+            "هيتضاف تلقائيًا كحقل \"ownerUid\" في أي تطبيق تنشره من دلوقتي.",
             reply_markup=main_menu_kb(),
         )
         return
@@ -2261,7 +2302,7 @@ async def start_publish_flow(query, context, st):
     await query.edit_message_text(
         "📤 نشر تطبيق جديد على الموقع\n\n"
         "هسألك بيانات التطبيق حقل حقل زي فورم الموقع بالظبط.\n"
-        "أي حقل مش إجباري تقدر تتخطاه بإرسال \"-\".\n\n"
+        "أي حقل مش إجباري تقدر تتخطاه بزرار \"⏭ تخطي\" أو بإرسال \"-\".\n\n"
         "يلا نبدأ 👇"
     )
     await prompt_publish_step(context.bot, query.message.chat_id, st)
@@ -2296,16 +2337,21 @@ async def prompt_publish_step(bot, chat_id, st):
     if stype == "list_loop":
         st["publish_list_temp"] = []
         st["await"] = "publish_field_text"
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏭ تخطي", callback_data=f"pubskip:{step_idx}")]]) \
+            if not step["required"] else None
         await bot.send_message(
             chat_id,
             f"{label} {step['prompt']}\n"
-            "(ابعت كل شرط في رسالة لوحده، وابعت \"تم\" لما تخلص، أو \"-\" لو مفيش شروط)"
+            "(ابعت كل شرط في رسالة لوحده، وابعت \"تم\" لما تخلص، أو اضغط تخطي لو مفيش شروط)",
+            reply_markup=kb,
         )
         return
 
-    skip_note = "" if step["required"] else "\n(ابعت \"-\" لو عايز تتخطاه)"
+    skip_note = "" if step["required"] else "\n(اضغط \"⏭ تخطي\" أو ابعت \"-\")"
     st["await"] = "publish_field_text"
-    await bot.send_message(chat_id, f"{label} {step['prompt']}{skip_note}")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏭ تخطي", callback_data=f"pubskip:{step_idx}")]]) \
+        if not step["required"] else None
+    await bot.send_message(chat_id, f"{label} {step['prompt']}{skip_note}", reply_markup=kb)
 
 
 async def handle_publish_text_input(update, context, st, text):
@@ -2368,6 +2414,28 @@ async def handle_publish_text_input(update, context, st, text):
     st["publish_step"] = step_idx + 1
     st.pop("await", None)
     await prompt_publish_step(bot, chat_id, st)
+
+
+async def handle_publish_skip_callback(query, context, st, step_idx):
+    """معادلة ضغط زرار ⏭ تخطي لنفس منطق إرسال "-" في handle_publish_text_input."""
+    step = PUBLISH_FIELDS[step_idx]
+    if step["required"]:
+        await query.answer("❌ الحقل ده إجباري، من فضلك اكتب قيمة.", show_alert=True)
+        return
+
+    if step["type"] == "list_loop":
+        st["publish_data"][step["key"]] = st.pop("publish_list_temp", []) or []
+    elif step["type"] == "multiline_list":
+        st["publish_data"][step["key"]] = []
+    elif step["type"] == "json":
+        pass  # لا نحفظ قيمة للحقل خالص
+    else:
+        st["publish_data"][step["key"]] = ""
+
+    st["publish_step"] = step_idx + 1
+    st.pop("await", None)
+    await query.edit_message_text(f"{step['prompt']}\n⏭ اتخطى")
+    await prompt_publish_step(context.bot, query.message.chat_id, st)
 
 
 async def handle_publish_choice_callback(query, context, st, step_idx, val_raw):
@@ -2440,6 +2508,10 @@ async def finalize_publish(bot, chat_id, st):
     }
     if d.get("topReviews"):
         app_data["topReviews"] = d["topReviews"]
+
+    owner_uid = CFG.get("firebase_owner_uid", "").strip()
+    if owner_uid:
+        app_data["ownerUid"] = owner_uid
 
     # نحوّل علامة الـ timestamp لصيغة Firestore الفعلية (بديل عن serverTimestamp
     # اللي متاح بس في الـ SDK مش في REST create مباشرة)
@@ -2851,6 +2923,12 @@ async def _handle_callback(query, context, uid, data, st):
             await query.edit_message_text("⚠️ الخطوة دي قديمة أو خلصت، جرب تاني من القائمة.", reply_markup=main_menu_kb())
             return
         await handle_publish_choice_callback(query, context, st, step_idx, val_raw)
+    elif data.startswith("pubskip:"):
+        step_idx = int(data.split(":", 1)[1])
+        if step_idx != st.get("publish_step", -1):
+            await query.edit_message_text("⚠️ الخطوة دي قديمة أو خلصت، جرب تاني من القائمة.", reply_markup=main_menu_kb())
+            return
+        await handle_publish_skip_callback(query, context, st, step_idx)
     elif data == "confirm_insert":
         await query.edit_message_text("⏳ جاري الإضافة...")
         result = await asyncio.to_thread(
@@ -2895,6 +2973,19 @@ async def _handle_callback(query, context, uid, data, st):
             "ابعت التوكن الجديد (Personal Access Token) دلوقتي كرسالة واحدة.\n"
             "⚠️ همسح رسالتك اللي فيها التوكن فورًا من الشات بعد الحفظ، "
             "عشان ميفضلش ظاهر في تاريخ المحادثة."
+        )
+
+    # ── تحديث User UID (Firebase) ──
+    elif data == "menu_update_owner_uid":
+        st["await"] = "new_owner_uid"
+        current_uid = CFG.get("firebase_owner_uid", "").strip() or "غير محدد"
+        await query.edit_message_text(
+            "🆔 تحديث User UID\n\n"
+            f"القيمة الحالية: `{current_uid}`\n\n"
+            "ابعت الـ User UID بتاع حساب الأدمن في Firebase Authentication "
+            "(هتلاقيه في Firebase Console → Authentication → Users)، مثال:\n"
+            "`QtoWqaDrgQUc0cuyERXLjXKRlj72`\n\n"
+            "ده هيتحفظ ويُستخدم تلقائيًا كحقل \"ownerUid\" في كل تطبيق تنشره."
         )
 
     # ── تنزيل من رابط ──
@@ -2973,6 +3064,27 @@ async def _handle_callback(query, context, uid, data, st):
 # =============================================================================
 async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
     import traceback
+
+    # ── TimedOut / NetworkError عادةً مجرد تهنيقة شبكة عابرة (خصوصًا على
+    # Railway)، مش باج فعلي في الكود — مكتبة python-telegram-bot بتعيد
+    # المحاولة تلقائيًا لحالات كتير منها. فبدل ما نبعت تراسباك طويل مرعب
+    # للأدمن في كل مرة، نبعت تنبيه قصير ونكمل عادي.
+    if isinstance(context.error, (TimedOut, NetworkError)):
+        log.warning(f"⏳ تأخير/انقطاع شبكة عابر: {context.error}")
+        admins = CFG.get("admin_ids") or []
+        for admin_id in admins:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=(
+                        f"⏳ تأخير شبكة عابر مع تليجرام (Instance: {INSTANCE_ID}): "
+                        f"{context.error}\nالبوت بيحاول تاني تلقائيًا، مش لازم تعمل حاجة."
+                    ),
+                )
+            except Exception:
+                pass
+        return
+
     tb = "".join(traceback.format_exception(None, context.error, context.error.__traceback__))
     log.error(f"🔥 استثناء غير متوقع:\n{tb}")
 
@@ -3009,7 +3121,31 @@ def main():
         print("❌ من فضلك ضع التوكن في config.json (bot_token) قبل التشغيل.")
         sys.exit(1)
 
-    app = Application.builder().token(token).build()
+    # ── مهلات شبكة أطول من الافتراضي (5 ثواني بس) ──────────────────────────
+    # ده اللي كان بيسبب أخطاء "TimedOut" بشكل متكرر على سيرفرات زي Railway،
+    # لأن أي تأخير بسيط في الشبكة (أو استجابة تليجرام) أكبر من 5 ثواني كان
+    # كافي يفشّل الطلب. رفعنا المهلات هنا لكل الطلبات العادية (رسائل/أزرار)،
+    # ومهلة أطول شوية لـ get_updates (طول polling) عشان تستحمل استخدام
+    # long-polling العادي بدون timeouts وهمية.
+    request = HTTPXRequest(
+        connect_timeout=30.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=30.0,
+    )
+    get_updates_request = HTTPXRequest(
+        connect_timeout=30.0,
+        read_timeout=40.0,
+        write_timeout=30.0,
+        pool_timeout=30.0,
+    )
+    app = (
+        Application.builder()
+        .token(token)
+        .request(request)
+        .get_updates_request(get_updates_request)
+        .build()
+    )
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu",  cmd_menu))
     app.add_handler(CallbackQueryHandler(on_callback))
