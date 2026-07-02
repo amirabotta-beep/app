@@ -1728,6 +1728,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_filename_search_result(update, st, text)
         return
 
+    if awaiting == "publish_autofill_url":
+        st.pop("await", None)
+        url = text.strip()
+        if not url.lower().startswith(("http://", "https://")):
+            await update.message.reply_text("❌ ده مش رابط سليم، لازم يبدأ بـ http:// أو https://. ابعته تاني:")
+            st["await"] = "publish_autofill_url"
+            return
+        await start_publish_autofill(context, update.effective_chat.id, st, url)
+        return
+
     if awaiting == "publish_field_text":
         await handle_publish_text_input(update, context, st, text)
         return
@@ -2388,21 +2398,256 @@ def _publish_slugify(text_):
     return text_
 
 
-async def start_publish_flow(query, context, st):
-    st["publish_data"] = {}
+# =============================================================================
+# تعبئة بيانات التطبيق أوتوماتيك من رابط صفحة تطبيق (زي Uptodown وشبهها)
+# ─────────────────────────────────────────────────────────────────────────
+# استخراج "بأفضل جهد ممكن" (best-effort): بنعتمد على meta tags (بتبقى شبه
+# ثابتة على أي صفحة تطبيق) لأشياء زي الاسم/الوصف/الأيقونة/المطور، وبنحاول
+# regex إضافي للحقول الأصعب (تقييم/حجم/تصنيف...). أي حقل مانقدرش نستخرجه
+# ببساطة بنسيبه فاضي، وهيتسأل عادي زي أي حقل يدوي في الخطوات اللي بعد كده.
+# =============================================================================
+import html as _html_lib
+
+_AR_MONTHS = {
+    "يناير": 1, "فبراير": 2, "مارس": 3, "أبريل": 4, "ابريل": 4, "مايو": 5,
+    "يونيو": 6, "يوليو": 7, "أغسطس": 8, "اغسطس": 8, "سبتمبر": 9,
+    "أكتوبر": 10, "اكتوبر": 10, "نوفمبر": 11, "ديسمبر": 12,
+}
+_EN_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+_PUBLISH_CATEGORY_KEYWORDS = {
+    "games": "games", "game": "games", "العاب": "games", "ألعاب": "games",
+    "social": "social", "communication": "social", "تواصل اجتماعي": "social", "التواصل": "social",
+    "education": "education", "تعليم": "education",
+    "health": "health", "fitness": "health", "lifestyle": "health", "صحة": "health", "لياقة": "health",
+    "finance": "finance", "مالية": "finance", "finances": "finance",
+    "tools": "tools", "productivity": "tools", "الأدوات": "tools", "أدوات": "tools",
+}
+
+
+def _meta_tag(html_text: str, prop: str) -> str:
+    pat1 = rf'<meta[^>]+(?:property|name)=["\']{re.escape(prop)}["\'][^>]*content=["\']([^"\']*)["\']'
+    pat2 = rf'<meta[^>]+content=["\']([^"\']*)["\'][^>]*(?:property|name)=["\']{re.escape(prop)}["\']'
+    m = re.search(pat1, html_text, re.I) or re.search(pat2, html_text, re.I)
+    return _html_lib.unescape(m.group(1)).strip() if m else ""
+
+
+def _label_link_value(html_text: str, *labels: str) -> str:
+    """يدور على أقرب <a>...</a> بعد أي label من اللي جايين، زي صف جدول 'المطور: <a>اسم</a>'."""
+    for label in labels:
+        m = re.search(rf'{re.escape(label)}[^<]{{0,40}}<a[^>]*>([^<]{{1,120}}?)</a>', html_text, re.I)
+        if m:
+            return _html_lib.unescape(m.group(1)).strip()
+    return ""
+
+
+def _label_text_value(plain_text: str, pattern: str) -> str:
+    m = re.search(pattern, plain_text, re.I)
+    return _html_lib.unescape(m.group(1)).strip() if m else ""
+
+
+def _parse_arabic_or_english_date(raw: str) -> str:
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    m = re.match(r"(\d{1,2})\s+([^\d,]+?)\s+(\d{4})", raw)
+    if not m:
+        return ""
+    day, month_word, year = m.group(1), m.group(2).strip().lower(), m.group(3)
+    month_num = _AR_MONTHS.get(month_word) or _EN_MONTHS.get(month_word[:3])
+    if not month_num:
+        return ""
+    try:
+        return f"{int(year):04d}-{month_num:02d}-{int(day):02d}"
+    except Exception:
+        return ""
+
+
+def _guess_category(raw_category_text: str) -> str:
+    low = (raw_category_text or "").strip().lower()
+    for kw, slug in _PUBLISH_CATEGORY_KEYWORDS.items():
+        if kw in low:
+            return slug
+    return ""
+
+
+def scrape_app_info_sync(url: str) -> dict:
+    """
+    يجيب بيانات تطبيق من صفحته (Uptodown أو أي صفحة مشابهة فيها meta tags
+    عادية) ويرجع dict بمفاتيح زي مفاتيح PUBLISH_FIELDS — أي حقل ملقاهوش
+    ببساطة بيتسيب من غير ما يتحط في الـ dict خالص.
+    """
+    out = {}
+    try:
+        r = requests.get(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                ),
+                "Accept-Language": "ar,en;q=0.8",
+            },
+            timeout=25,
+        )
+        r.raise_for_status()
+    except Exception as e:
+        return {"_error": f"فشل تحميل الصفحة:\n{e}"}
+
+    html_text = r.text
+    plain_text = re.sub(r"<[^>]+>", " ", html_text)
+    plain_text = re.sub(r"\s+", " ", _html_lib.unescape(plain_text)).strip()
+
+    # ── الاسم ──
+    title = _meta_tag(html_text, "og:title")
+    name = re.sub(r"\s*\([^)]*\)\s*$", "", title).strip()
+    if name:
+        out["name"] = name
+
+    # ── الوصف (بناخد الأطول بين og:description و meta description) ──
+    desc_og   = _meta_tag(html_text, "og:description")
+    desc_meta = _meta_tag(html_text, "description")
+    description = desc_meta if len(desc_meta) > len(desc_og) else desc_og
+    if description:
+        out["description"] = description
+
+    # ── الأيقونة ──
+    icon = _meta_tag(html_text, "og:image")
+    if icon:
+        out["icon"] = icon
+        out["headerImage"] = icon
+
+    # ── المطور (twitter:data2 غالبًا بيبقى اسم الناشر/المطور على Uptodown) ──
+    developer = _meta_tag(html_text, "twitter:data2")
+    if not developer:
+        developer = _label_link_value(html_text, "المُطوِّر", "المطور", "Developer")
+    if developer:
+        out["developer"] = developer
+
+    # ── رقم الإصدار (من عنوان الصفحة، بيبقى فيه رقم زي "18.5.0") ──
+    version_source = _meta_tag(html_text, "twitter:title") or title
+    m = re.search(r"\b(\d+(?:\.\d+){1,3})\b", version_source)
+    if m:
+        out["version"] = m.group(1)
+
+    # ── التصنيف (نحاول نطابقه مع تصنيفاتنا المحدودة، لو مافيش تطابق بنسيبه) ──
+    category_raw = _label_link_value(html_text, "الفئة", "Category")
+    mapped_cat = _guess_category(category_raw)
+    if mapped_cat:
+        out["category"] = mapped_cat
+
+    # ── التقييم وعدد التقييمات ──
+    m = re.search(r"(\d+(?:\.\d+)?)\s+([\d,]{2,})\s*(?:التعليقات|reviews|ratings)", plain_text, re.I)
+    if m:
+        try:
+            out["rating"] = float(m.group(1))
+            out["ratingCount"] = int(m.group(2).replace(",", ""))
+        except ValueError:
+            pass
+
+    # ── عدد التنزيلات (كنص زي "159.1 M") ──
+    installs = _label_text_value(plain_text, r"([\d.,]+\s?[KMB]\+?)\s*(?:عدد مرات التنزيل|downloads)")
+    if not installs:
+        installs = _label_text_value(plain_text, r"(?:عدد مرات التنزيل|downloads)\s*[:\|]?\s*([\d.,]+\s?[KMB]\+?)")
+    if installs:
+        out["installs"] = installs
+
+    # ── حجم التطبيق ──
+    size = _label_text_value(plain_text, r"(?:الحجم|Size)\s*[:\|]?\s*([\d.,]+\s?[KMG]B)")
+    if size:
+        out["size"] = size
+
+    # ── تاريخ آخر تحديث ──
+    date_raw = _label_text_value(plain_text, r"(?:التاريخ|Date)\s*[:\|]?\s*(\d{1,2}\s+[^\d,]{2,15}\s+\d{4})")
+    release_date = _parse_arabic_or_english_date(date_raw)
+    if release_date:
+        out["releaseDate"] = release_date
+
+    # ── Package ID ──
+    pkg = _label_text_value(
+        plain_text,
+        r"(?:اسم حزمة العرض|Package Name|Package ID)\s*[:\|]?\s*([a-zA-Z][a-zA-Z0-9_]*(?:\.[a-zA-Z0-9_]+){1,8})",
+    )
+    if pkg:
+        out["packageId"] = pkg
+
+    # ── أقل إصدار أندرويد مطلوب (تخمين مبدئي، مش مضمون 100%) ──
+    andv = _label_text_value(plain_text, r"Android\s*\+?\s*([\d]+\.[\d]+)")
+    if andv:
+        out["androidVersion"] = andv
+
+    return out
+
+
+async def start_publish_flow(query, context, st, prefill=None):
+    st["publish_data"] = dict(prefill or {})
     st["publish_step"] = 0
     st.pop("publish_list_temp", None)
-    await query.edit_message_text(
+    intro = (
         "📤 نشر تطبيق جديد على الموقع\n\n"
         "هسألك بيانات التطبيق حقل حقل زي فورم الموقع بالظبط.\n"
         "أي حقل مش إجباري تقدر تتخطاه بزرار \"⏭ تخطي\" أو بإرسال \"-\".\n\n"
         "يلا نبدأ 👇"
     )
+    if prefill:
+        filled_lines = "\n".join(f"• {k}: {v}" for k, v in prefill.items() if str(v).strip())
+        intro = (
+            "✅ الحقول اللي اتلقطت أوتوماتيك من الرابط:\n"
+            f"{filled_lines}\n\n"
+            "دلوقتي هسألك بس على الباقي (وحقل رابط التنزيل المباشر هتكتبه انت):\n👇"
+        )
+    await query.edit_message_text(intro)
     await prompt_publish_step(context.bot, query.message.chat_id, st)
+
+
+async def start_publish_autofill(context, chat_id, st, url):
+    status_msg = await context.bot.send_message(chat_id, "⏳ جاري قراءة صفحة التطبيق واستخراج البيانات...")
+    scraped = await asyncio.to_thread(scrape_app_info_sync, url)
+
+    if scraped.get("_error"):
+        await status_msg.edit_text(
+            f"{scraped['_error']}\n\nهنكمل تعبئة البيانات يدوي بدل كده.",
+        )
+        st["publish_data"] = {}
+        st["publish_step"] = 0
+        st.pop("publish_list_temp", None)
+        await prompt_publish_step(context.bot, chat_id, st)
+        return
+
+    st["publish_data"] = {k: v for k, v in scraped.items() if not k.startswith("_")}
+    st["publish_step"] = 0
+    st.pop("publish_list_temp", None)
+
+    if st["publish_data"]:
+        filled_lines = "\n".join(f"• {k}: {v}" for k, v in st["publish_data"].items() if str(v).strip())
+        await status_msg.edit_text(
+            "✅ اللي اتلقط أوتوماتيك من الرابط:\n"
+            f"{filled_lines}\n\n"
+            "دلوقتي هسألك بس على الباقي (ورابط التنزيل المباشر لازم تكتبه انت):"
+        )
+    else:
+        await status_msg.edit_text("⚠️ مقدرتش ألاقي حاجة في الصفحة دي، هسألك على كل البيانات يدوي.")
+
+    await prompt_publish_step(context.bot, chat_id, st)
 
 
 async def prompt_publish_step(bot, chat_id, st):
     step_idx = st.get("publish_step", 0)
+    data = st.setdefault("publish_data", {})
+
+    # ── تخطي أي حقل اتلقط أوتوماتيك بالفعل من رابط autofill (ما عدا
+    # directUrl، اللي المستخدم بيكتبه هو دايمًا يدوي) ──
+    while step_idx < len(PUBLISH_FIELDS):
+        key_at_step = PUBLISH_FIELDS[step_idx]["key"]
+        if key_at_step != "directUrl" and key_at_step in data:
+            step_idx += 1
+            continue
+        break
+    st["publish_step"] = step_idx
+
     if step_idx >= len(PUBLISH_FIELDS):
         await finalize_publish(bot, chat_id, st)
         return
@@ -3008,6 +3253,26 @@ async def _handle_callback(query, context, uid, data, st):
 
     # ── نشر تطبيق على الموقع ──
     elif data == "menu_publish_app":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔗 آه، من رابط صفحة تطبيق", callback_data="pubauto_yes")],
+            [InlineKeyboardButton("✍️ لأ، هدخل البيانات يدوي", callback_data="pubauto_no")],
+        ])
+        await query.edit_message_text(
+            "📤 نشر تطبيق جديد على الموقع\n\n"
+            "عايز تملي الحقول أوتوماتيك من رابط صفحة تطبيق (زي Uptodown)، "
+            "ولا هتكتب البيانات بنفسك؟",
+            reply_markup=kb,
+        )
+    elif data == "pubauto_yes":
+        st["await"] = "publish_autofill_url"
+        await query.edit_message_text(
+            "🔗 ابعت رابط صفحة التطبيق دلوقتي، مثال:\n"
+            "`https://viamaker.ar.uptodown.com/android`\n\n"
+            "هحاول أطلع منها كل حاجة أقدر عليها (الاسم، المطور، الأيقونة، الوصف، "
+            "التقييم، الحجم...إلخ)، وأي حاجة مش لاقيها هسألك عليها عادي — "
+            "ورابط التنزيل المباشر هتكتبه انت دايمًا."
+        )
+    elif data == "pubauto_no":
         await start_publish_flow(query, context, st)
     elif data.startswith("pub:"):
         _, step_idx_s, val_raw = data.split(":", 2)
