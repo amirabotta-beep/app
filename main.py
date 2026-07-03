@@ -1252,7 +1252,7 @@ def main_menu_kb():
         [InlineKeyboardButton("📥 تنزيل APK من رابط", callback_data="menu_download_url")],
         [InlineKeyboardButton("🖊 تجميع وتوقيع", callback_data="menu_build")],
         [InlineKeyboardButton("🔍 بحث واستبدال smali", callback_data="menu_search")],
-        [InlineKeyboardButton("📄 بحث باسم ملف واستبداله", callback_data="menu_search_filename")],
+        [InlineKeyboardButton("📄 استبدال ملف/ملفات بالاسم (تلقائي)", callback_data="menu_search_filename")],
         [InlineKeyboardButton("📤 نشر تطبيق على الموقع", callback_data="menu_publish_app")],
         [InlineKeyboardButton("📦 نقل classes.zip", callback_data="menu_classes")],
         [InlineKeyboardButton("🔑 إدارة شهادات التوقيع", callback_data="menu_keystores")],
@@ -1355,23 +1355,58 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if st.get("await") == "filename_replace_upload":
-        target_rel = st.get("filename_replace_target")
-        if not target_rel:
+        if not os.path.isdir(PROJECT_DIR):
             st.pop("await", None)
-            await update.message.reply_text("❌ حصل خطأ، جرب تاني من القائمة.", reply_markup=main_menu_kb())
+            await update.message.reply_text("❌ لا يوجد مشروع مفكوك حالياً.", reply_markup=main_menu_kb())
             return
-        tmp_path = os.path.join(WORKSPACE_DIR, f"upload_{random_string(6)}_{doc.file_name or 'file'}")
+
+        tmp_dir = os.path.join(WORKSPACE_DIR, f"fnreplace_{random_string(6)}")
+        os.makedirs(tmp_dir, exist_ok=True)
+        tmp_path = os.path.join(tmp_dir, doc.file_name or "file")
         f = await doc.get_file()
         await f.download_to_drive(tmp_path)
-        result = await asyncio.to_thread(replace_file_sync, PROJECT_DIR, target_rel, tmp_path)
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
+
+        incoming = {}  # اسم الملف → مسار الملف على الديسك
+        if name.endswith(".zip"):
+            try:
+                extract_dir = os.path.join(tmp_dir, "extracted")
+                with zipfile.ZipFile(tmp_path, "r") as zf:
+                    zf.extractall(extract_dir)
+                    for member in zf.namelist():
+                        if member.endswith("/"):
+                            continue
+                        fn = os.path.basename(member)
+                        if not fn:
+                            continue
+                        incoming[fn] = os.path.join(extract_dir, member)
+            except Exception as e:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                st.pop("await", None)
+                await update.message.reply_text(f"❌ فشل فتح ملف الـ ZIP:\n{e}", reply_markup=main_menu_kb())
+                return
+        else:
+            incoming[doc.file_name or "file"] = tmp_path
+
+        replaced, skipped = await asyncio.to_thread(replace_files_by_name_sync, PROJECT_DIR, incoming)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         st.pop("await", None)
-        st.pop("filename_replace_target", None)
-        st.pop("filename_matches", None)
-        await update.message.reply_text(result, reply_markup=main_menu_kb())
+
+        lines = []
+        if replaced:
+            lines.append(f"✅ اتبدل ({len(replaced)}):")
+            for fname, paths in replaced:
+                if len(paths) == 1:
+                    lines.append(f"• {fname} ← {paths[0]}")
+                else:
+                    lines.append(f"• {fname} ← {len(paths)} أماكن:")
+                    lines.extend(f"    - {p}" for p in paths)
+        if skipped:
+            lines.append(f"\n⏭ اتخطى (مفيش ملف بنفس الاسم في المشروع) ({len(skipped)}):")
+            lines.extend(f"• {fname}" for fname in skipped)
+        if not lines:
+            lines.append("⚠️ الملف ده مكانش فيه أي حاجة قدرت أستبدلها.")
+
+        await update.message.reply_text(tail_log("\n".join(lines), 3500), reply_markup=main_menu_kb())
         return
 
     if name.endswith(".apk"):
@@ -1721,11 +1756,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"عند كل سطر فيه:\n\"{st.get('search_text','')}\"\nهيتم إضافة سطر جديد تحته:\n\"{text}\"\n\n{target_note}. تأكيد؟",
             reply_markup=InlineKeyboardMarkup(kb),
         )
-        return
-
-    if awaiting == "search_filename_keyword":
-        st.pop("await", None)
-        await handle_filename_search_result(update, st, text)
         return
 
     if awaiting == "publish_autofill_url":
@@ -2101,21 +2131,6 @@ def find_matching_smali_files(project_dir, search_text):
     return results
 
 
-def find_files_by_name(project_dir, name_query):
-    """يبحث عن كل الملفات (أي نوع) اللي اسمها يحتوي على name_query
-    (بدون حساسية لحالة الأحرف)، ويرجّع المسارات النسبية مرتبة."""
-    q = (name_query or "").strip().lower()
-    if not q:
-        return []
-    matches = []
-    for root_dir, _, filenames in os.walk(project_dir):
-        for fn in filenames:
-            if q in fn.lower():
-                matches.append(os.path.relpath(os.path.join(root_dir, fn), project_dir))
-    matches.sort()
-    return matches
-
-
 def replace_file_sync(project_dir, target_rel, new_file_path):
     """يستبدل محتوى ملف موجود داخل المشروع بملف جديد، مع الاحتفاظ
     بنسخة احتياطية من الملف القديم قبل الاستبدال."""
@@ -2299,38 +2314,60 @@ async def proceed_search_action(query, st, action):
 
 
 # =============================================================================
-# البحث باسم الملف واستبداله
+# استبدال ملف/ملفات بمطابقة الاسم بالظبط (تلقائي، من غير كتابة اسم)
+# ─────────────────────────────────────────────────────────────────────────
+# المستخدم بيبعت ملف واحد أو ملف ZIP فيه أكتر من ملف، والبوت بيدور تلقائي
+# جوه المشروع على أي ملف بنفس الاسم بالظبط (case-sensitive) ويستبدله. أي
+# ملف من اللي اتبعت ومالوش نظير بنفس الاسم في المشروع بيتخطى وبيتقال
+# للمستخدم في الآخر مع لستة اللي اتبدلوا فعلاً.
 # =============================================================================
 async def start_search_filename_flow(query, st):
     if not os.path.isdir(PROJECT_DIR):
         await query.edit_message_text("❌ لا يوجد مشروع مفكوك حالياً.", reply_markup=main_menu_kb())
         return
-    st["await"] = "search_filename_keyword"
+    st["await"] = "filename_replace_upload"
     await query.edit_message_text(
-        "📄 اكتب اسم الملف أو جزء منه اللي عايز تدور عليه في كل ملفات المشروع (مثلاً: pk.smali):"
+        "📄 ابعت الملف اللي عايز تستبدله دلوقتي، أو ابعت ملف ZIP فيه أكتر من ملف دفعة واحدة.\n\n"
+        "هدور تلقائي جوه المشروع على أي ملف بنفس الاسم بالظبط (مهما كان مكانه)، "
+        "وأستبدله. أي ملف اسمه مش موجود في المشروع هتخطاه وأقولك عليه في الآخر."
     )
 
 
-async def handle_filename_search_result(update, st, name_query):
-    matches = await asyncio.to_thread(find_files_by_name, PROJECT_DIR, name_query)
-    if not matches:
-        await update.message.reply_text(
-            f"❌ مفيش أي ملف اسمه بيحتوي على:\n\"{name_query}\"",
-            reply_markup=main_menu_kb(),
-        )
-        return
+def replace_files_by_name_sync(project_dir, incoming_paths: dict):
+    """incoming_paths: dict {اسم الملف: مسار الملف على الديسك}. بيدور جوه
+    المشروع على أي ملف بنفس الاسم بالظبط (في أي مكان)، ولو لقاه يستبدله
+    (مع نسخة احتياطية من القديم)، ولو مالقاش يتخطاه. بيرجّع (replaced, skipped)."""
+    name_to_paths = {}
+    for root_dir, _, filenames in os.walk(project_dir):
+        for fn in filenames:
+            name_to_paths.setdefault(fn, []).append(
+                os.path.relpath(os.path.join(root_dir, fn), project_dir)
+            )
 
-    st["filename_matches"] = matches
-    rows = []
-    for idx, rel in enumerate(matches[:30]):
-        rows.append([InlineKeyboardButton(f"📄 {rel}", callback_data=f"fnpick:{idx}")])
-    rows.append([InlineKeyboardButton("⬅️ رجوع", callback_data="back_main")])
-    extra = "" if len(matches) <= 30 else f"\n(بيتم عرض أول 30 من {len(matches)} نتيجة)"
-    await update.message.reply_text(
-        f"🔍 لقيت {len(matches)} ملف بيطابق:\n\"{name_query}\"{extra}\n\n"
-        "اختار الملف اللي عايز تستبدله:",
-        reply_markup=InlineKeyboardMarkup(rows),
-    )
+    backup_dir = os.path.join(project_dir, "_backup_before_filereplace")
+    replaced = []  # [(filename, [rel_paths])]
+    skipped  = []  # [filename]
+
+    for fname, local_path in incoming_paths.items():
+        rel_list = name_to_paths.get(fname)
+        if not rel_list:
+            skipped.append(fname)
+            continue
+        for rel in rel_list:
+            target_path = os.path.join(project_dir, rel)
+            backup_path = os.path.join(backup_dir, rel)
+            try:
+                os.makedirs(os.path.dirname(backup_path), exist_ok=True)
+                shutil.copy2(target_path, backup_path)
+            except Exception:
+                pass
+            try:
+                shutil.copy2(local_path, target_path)
+            except Exception:
+                pass
+        replaced.append((fname, rel_list))
+
+    return replaced, skipped
 
 
 # =============================================================================
@@ -3287,19 +3324,9 @@ async def _handle_callback(query, context, uid, data, st):
         )
         await query.edit_message_text(result, reply_markup=main_menu_kb())
 
-    # ── بحث باسم ملف واستبداله ──
+    # ── استبدال ملف/ملفات بمطابقة الاسم تلقائي ──
     elif data == "menu_search_filename":
         await start_search_filename_flow(query, st)
-    elif data.startswith("fnpick:"):
-        idx = int(data.split(":", 1)[1])
-        matches = st.get("filename_matches", [])
-        if idx >= len(matches):
-            await query.edit_message_text("❌ حصل خطأ، جرب تاني من القائمة.", reply_markup=main_menu_kb())
-            return
-        target_rel = matches[idx]
-        st["filename_replace_target"] = target_rel
-        st["await"] = "filename_replace_upload"
-        await query.edit_message_text(f"📄 هيتم استبدال:\n{target_rel}\n\n📤 ابعت الملف البديل دلوقتي.")
 
     # ── نشر تطبيق على الموقع ──
     elif data == "menu_publish_app":
