@@ -1738,8 +1738,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start_publish_autofill(context, update.effective_chat.id, st, url)
         return
 
-    if awaiting == "publish_field_text":
-        await handle_publish_text_input(update, context, st, text)
+    if awaiting == "publish_field_edit":
+        await handle_publish_field_text(update, context, st, text)
         return
 
     await update.message.reply_text("اختار من القائمة:", reply_markup=main_menu_kb())
@@ -2346,43 +2346,43 @@ async def handle_filename_search_result(update, st, name_query):
 #   list_loop      → رسالة لكل عنصر، وابعت "تم" لما تخلص (شروط التشغيل)
 #   json           → نص بصيغة JSON (تقييمات المستخدمين)
 PUBLISH_FIELDS = [
-    {"key": "name",       "prompt": "✍️ اسم التطبيق:",                              "type": "text",  "required": True},
-    {"key": "developer",  "prompt": "✍️ اسم المطور:",                                "type": "text",  "required": True},
-    {"key": "packageId",  "prompt": "📦 Package ID (مثال: com.whatsapp):",           "type": "text",  "required": False},
-    {"key": "category",   "prompt": "📂 التصنيف:", "type": "choice", "required": True, "choices": [
+    {"key": "name",       "short": "✍️ الاسم",     "prompt": "✍️ اسم التطبيق:",                              "type": "text",  "required": True},
+    {"key": "developer",  "short": "✍️ المطور",    "prompt": "✍️ اسم المطور:",                                "type": "text",  "required": True},
+    {"key": "packageId",  "short": "📦 Package ID", "prompt": "📦 Package ID (مثال: com.whatsapp):",           "type": "text",  "required": False},
+    {"key": "category",   "short": "📂 التصنيف",   "prompt": "📂 التصنيف:", "type": "choice", "required": True, "choices": [
         ("games", "🎮 ألعاب"), ("social", "💬 تواصل اجتماعي"), ("tools", "🔧 أدوات"),
         ("education", "📚 تعليم"), ("health", "💪 صحة ولياقة"), ("finance", "💰 مالية"),
     ]},
-    {"key": "icon",        "prompt": "🖼 رابط الأيقونة (URL):",                       "type": "text",  "required": False},
-    {"key": "directUrl",   "prompt": "🔗 رابط التنزيل المباشر:",                      "type": "text",  "required": True},
-    {"key": "rating",      "prompt": "⭐ التقييم (من 1 لـ 5، مثال: 4.3):",           "type": "float", "required": False},
-    {"key": "ratingCount", "prompt": "🔢 عدد التقييمات (مثال: 5000000):",            "type": "int",   "required": False},
-    {"key": "size",        "prompt": "📦 حجم التطبيق (مثال: 55 MB):",                "type": "text",  "required": False},
-    {"key": "installs",    "prompt": "📥 عدد التثبيتات (مثال: 1B+):",                "type": "text",  "required": False},
-    {"key": "description", "prompt": "📝 وصف التطبيق:",                              "type": "text",  "required": False},
-    {"key": "headerImage", "prompt": "🖼 رابط صورة الترويسة (Header Image):",         "type": "text",  "required": False},
-    {"key": "screenshots", "prompt": "📸 روابط لقطات الشاشة — كل رابط في سطر (حتى 8 روابط):", "type": "multiline_list", "required": False},
-    {"key": "version",        "prompt": "🔢 رقم الإصدار (مثال: 2.24.1):",            "type": "text", "required": False},
-    {"key": "androidVersion", "prompt": "🤖 أقل إصدار أندرويد مطلوب (مثال: 5.0):",   "type": "text", "required": False},
-    {"key": "contentRating", "prompt": "🔞 التصنيف العمري:", "type": "choice", "required": False, "choices": [
+    {"key": "icon",        "short": "🖼 الأيقونة",  "prompt": "🖼 رابط الأيقونة (URL):",                       "type": "text",  "required": False},
+    {"key": "directUrl",   "short": "🔗 رابط التنزيل", "prompt": "🔗 رابط التنزيل المباشر:",                  "type": "text",  "required": True},
+    {"key": "rating",      "short": "⭐ التقييم",   "prompt": "⭐ التقييم (من 1 لـ 5، مثال: 4.3):",           "type": "float", "required": False},
+    {"key": "ratingCount", "short": "🔢 عدد التقييمات", "prompt": "🔢 عدد التقييمات (مثال: 5000000):",        "type": "int",   "required": False},
+    {"key": "size",        "short": "📦 الحجم",     "prompt": "📦 حجم التطبيق (مثال: 55 MB):",                "type": "text",  "required": False},
+    {"key": "installs",    "short": "📥 التثبيتات", "prompt": "📥 عدد التثبيتات (مثال: 1B+):",                "type": "text",  "required": False},
+    {"key": "description", "short": "📝 الوصف",     "prompt": "📝 وصف التطبيق:",                              "type": "text",  "required": False},
+    {"key": "headerImage", "short": "🖼 صورة الترويسة", "prompt": "🖼 رابط صورة الترويسة (Header Image):",    "type": "text",  "required": False},
+    {"key": "screenshots", "short": "📸 لقطات الشاشة", "prompt": "📸 روابط لقطات الشاشة — كل رابط في سطر (حتى 8 روابط):", "type": "multiline_list", "required": False},
+    {"key": "version",        "short": "🔢 الإصدار",       "prompt": "🔢 رقم الإصدار (مثال: 2.24.1):",            "type": "text", "required": False},
+    {"key": "androidVersion", "short": "🤖 إصدار أندرويد", "prompt": "🤖 أقل إصدار أندرويد مطلوب (مثال: 5.0):",   "type": "text", "required": False},
+    {"key": "contentRating", "short": "🔞 التصنيف العمري", "prompt": "🔞 التصنيف العمري:", "type": "choice", "required": False, "choices": [
         ("", "بدون"), ("Everyone", "Everyone (للجميع)"), ("Everyone 10+", "Everyone 10+"),
         ("Teen", "Teen (13+)"), ("Mature 17+", "Mature 17+"),
     ]},
-    {"key": "releaseDate",     "prompt": "📅 تاريخ الإصدار الأصلي (YYYY-MM-DD):",     "type": "text", "required": False},
-    {"key": "adSupported",     "prompt": "📢 يحتوي إعلانات؟",                         "type": "bool", "required": False},
-    {"key": "inAppPurchases",  "prompt": "💳 فيه مشتريات داخلية؟",                    "type": "bool", "required": False},
-    {"key": "conditions", "prompt": "⚠️ شروط التشغيل (تظهر للمستخدم قبل التنزيل):",   "type": "list_loop", "required": False},
-    {"key": "topReviews", "prompt": "💬 تقييمات المستخدمين بصيغة JSON، مثال:\n[{\"author\":\"أحمد\",\"rating\":5,\"text\":\"تطبيق رائع!\",\"date\":\"2024-03\"}]", "type": "json", "required": False},
-    {"key": "badge", "prompt": "🏷 الشارة:", "type": "choice", "required": False, "choices": [
+    {"key": "releaseDate",     "short": "📅 تاريخ الإصدار", "prompt": "📅 تاريخ الإصدار الأصلي (YYYY-MM-DD):",     "type": "text", "required": False},
+    {"key": "adSupported",     "short": "📢 إعلانات؟",      "prompt": "📢 يحتوي إعلانات؟",                         "type": "bool", "required": False},
+    {"key": "inAppPurchases",  "short": "💳 مشتريات داخلية؟", "prompt": "💳 فيه مشتريات داخلية؟",                  "type": "bool", "required": False},
+    {"key": "conditions", "short": "⚠️ شروط التشغيل", "prompt": "⚠️ شروط التشغيل (تظهر للمستخدم قبل التنزيل):",   "type": "list_loop", "required": False},
+    {"key": "topReviews", "short": "💬 تقييمات المستخدمين", "prompt": "💬 تقييمات المستخدمين بصيغة JSON، مثال:\n[{\"author\":\"أحمد\",\"rating\":5,\"text\":\"تطبيق رائع!\",\"date\":\"2024-03\"}]", "type": "json", "required": False},
+    {"key": "badge", "short": "🏷 الشارة", "prompt": "🏷 الشارة:", "type": "choice", "required": False, "choices": [
         ("", "بدون شارة"), ("new", "🆕 جديد"), ("hot", "🔥 رائج"),
     ]},
-    {"key": "status", "prompt": "📊 حالة التطبيق:", "type": "choice", "required": False, "choices": [
+    {"key": "status", "short": "📊 الحالة", "prompt": "📊 حالة التطبيق:", "type": "choice", "required": False, "choices": [
         ("active", "✅ نشط"), ("hidden", "🔒 مخفي"),
     ]},
-    {"key": "featured",       "prompt": "⭐ يظهر كتطبيق مميز؟",                       "type": "bool", "required": False},
-    {"key": "seoTitle",       "prompt": "🔍 عنوان الصفحة في جوجل (SEO Title):",       "type": "text", "required": False},
-    {"key": "seoDescription", "prompt": "🔍 وصف الصفحة في جوجل (Meta Description، 120-160 حرف مثالي):", "type": "text", "required": False},
-    {"key": "seoSlug",        "prompt": "🔗 رابط الصفحة (SEO Slug)، مثال: whatsapp-download:", "type": "text", "required": False},
+    {"key": "featured",       "short": "⭐ مميز؟",         "prompt": "⭐ يظهر كتطبيق مميز؟",                       "type": "bool", "required": False},
+    {"key": "seoTitle",       "short": "🔍 عنوان SEO",     "prompt": "🔍 عنوان الصفحة في جوجل (SEO Title):",       "type": "text", "required": False},
+    {"key": "seoDescription", "short": "🔍 وصف SEO",       "prompt": "🔍 وصف الصفحة في جوجل (Meta Description، 120-160 حرف مثالي):", "type": "text", "required": False},
+    {"key": "seoSlug",        "short": "🔗 SEO Slug",      "prompt": "🔗 رابط الصفحة (SEO Slug)، مثال: whatsapp-download:", "type": "text", "required": False},
 ]
 
 
@@ -2515,10 +2515,30 @@ def scrape_app_info_sync(url: str) -> dict:
         out["description"] = description
 
     # ── الأيقونة ──
+    # ملحوظة: og:image على Uptodown بيرجع الأيقونة نفسها (مربعة)، ومش صورة
+    # ترويسة (banner) حقيقية — Uptodown أصلاً مافيهوش صورة ترويسة منفصلة.
+    # فبنملى بيها حقل "icon" بس، وبنسيب "headerImage" فاضي عشان تتملى يدوي
+    # لو عندك صورة ترويسة فعلية (مش هنحطلها الأيقونة غلط).
     icon = _meta_tag(html_text, "og:image")
     if icon:
         out["icon"] = icon
-        out["headerImage"] = icon
+
+    # ── لقطات الشاشة ──
+    # Uptodown بيستضيف لقطات الشاشة على img.utdstc.com/screen/... (بعكس
+    # الأيقونة اللي بتكون على img.utdstc.com/icon/...)، سواء كانت متحطة في
+    # src أو data-src أو أي attribute تاني (lazy loading)، فبندور على الرابط
+    # نفسه في أي مكان في الصفحة بدل ما نعتمد على اسم الـ attribute.
+    raw_shots = re.findall(
+        r'https?://[a-zA-Z0-9.\-]*utdstc\.com/screen/[^\s"\'<>)]+',
+        html_text,
+    )
+    screenshots = []
+    for shot in raw_shots:
+        shot = shot.rstrip(").,;")
+        if shot not in screenshots:
+            screenshots.append(shot)
+    if screenshots:
+        out["screenshots"] = screenshots[:8]
 
     # ── المطور (twitter:data2 غالبًا بيبقى اسم الناشر/المطور على Uptodown) ──
     developer = _meta_tag(html_text, "twitter:data2")
@@ -2584,23 +2604,26 @@ def scrape_app_info_sync(url: str) -> dict:
 
 async def start_publish_flow(query, context, st, prefill=None):
     st["publish_data"] = dict(prefill or {})
-    st["publish_step"] = 0
+    st.pop("publish_step", None)
     st.pop("publish_list_temp", None)
+    st.pop("publish_edit_idx", None)
+    st.pop("await", None)
     intro = (
         "📤 نشر تطبيق جديد على الموقع\n\n"
-        "هسألك بيانات التطبيق حقل حقل زي فورم الموقع بالظبط.\n"
-        "أي حقل مش إجباري تقدر تتخطاه بزرار \"⏭ تخطي\" أو بإرسال \"-\".\n\n"
-        "يلا نبدأ 👇"
+        "هتلاقي تحت كل الحقول مرة واحدة كأزرار. دوس على أي حقل عشان تملاه "
+        "أو تعدله، ولما تخلص دوس \"📤 نشر الآن\".\n"
+        "الحقول اللي عليها ❗ لازم تتملى قبل النشر."
     )
     if prefill:
         filled_lines = "\n".join(f"• {k}: {v}" for k, v in prefill.items() if str(v).strip())
         intro = (
             "✅ الحقول اللي اتلقطت أوتوماتيك من الرابط:\n"
             f"{filled_lines}\n\n"
-            "دلوقتي هسألك بس على الباقي (وحقل رابط التنزيل المباشر هتكتبه انت):\n👇"
+            "دوس على أي حقل تحت عشان تعدله أو تملي الباقي، ولما تخلص دوس "
+            "\"📤 نشر الآن\"."
         )
     await query.edit_message_text(intro)
-    await prompt_publish_step(context.bot, query.message.chat_id, st)
+    await send_publish_review(context.bot, query.message.chat_id, st)
 
 
 async def start_publish_autofill(context, chat_id, st, url):
@@ -2612,183 +2635,210 @@ async def start_publish_autofill(context, chat_id, st, url):
             f"{scraped['_error']}\n\nهنكمل تعبئة البيانات يدوي بدل كده.",
         )
         st["publish_data"] = {}
-        st["publish_step"] = 0
+        st.pop("publish_step", None)
         st.pop("publish_list_temp", None)
-        await prompt_publish_step(context.bot, chat_id, st)
+        st.pop("publish_edit_idx", None)
+        await send_publish_review(context.bot, chat_id, st)
         return
 
     st["publish_data"] = {k: v for k, v in scraped.items() if not k.startswith("_")}
-    st["publish_step"] = 0
+    st.pop("publish_step", None)
     st.pop("publish_list_temp", None)
+    st.pop("publish_edit_idx", None)
 
     if st["publish_data"]:
         filled_lines = "\n".join(f"• {k}: {v}" for k, v in st["publish_data"].items() if str(v).strip())
         await status_msg.edit_text(
             "✅ اللي اتلقط أوتوماتيك من الرابط:\n"
             f"{filled_lines}\n\n"
-            "دلوقتي هسألك بس على الباقي (ورابط التنزيل المباشر لازم تكتبه انت):"
+            "دوس على أي حقل تحت عشان تعدله أو تملي الباقي (رابط التنزيل "
+            "المباشر لازم تكتبه انت)."
         )
     else:
         await status_msg.edit_text("⚠️ مقدرتش ألاقي حاجة في الصفحة دي، هسألك على كل البيانات يدوي.")
 
-    await prompt_publish_step(context.bot, chat_id, st)
+    await send_publish_review(context.bot, chat_id, st)
 
 
-async def prompt_publish_step(bot, chat_id, st):
-    step_idx = st.get("publish_step", 0)
-    data = st.setdefault("publish_data", {})
-
-    # ── تخطي أي حقل اتلقط أوتوماتيك بالفعل من رابط autofill (ما عدا
-    # directUrl، اللي المستخدم بيكتبه هو دايمًا يدوي) ──
-    while step_idx < len(PUBLISH_FIELDS):
-        key_at_step = PUBLISH_FIELDS[step_idx]["key"]
-        if key_at_step != "directUrl" and key_at_step in data:
-            step_idx += 1
-            continue
-        break
-    st["publish_step"] = step_idx
-
-    if step_idx >= len(PUBLISH_FIELDS):
-        await finalize_publish(bot, chat_id, st)
-        return
-
-    step  = PUBLISH_FIELDS[step_idx]
+def _publish_field_preview(step, value):
     stype = step["type"]
-    label = f"({step_idx + 1}/{len(PUBLISH_FIELDS)})"
+    if stype == "bool":
+        if value is None or value == "":
+            return "—"
+        return "✅ نعم" if value else "❌ لا"
+    if stype == "choice":
+        for cval, disp in step["choices"]:
+            if cval == value:
+                return disp if cval else "—"
+        return "—"
+    if stype in ("multiline_list", "list_loop"):
+        return f"{len(value)} عنصر" if value else "—"
+    if stype == "json":
+        return "✅ محفوظ" if value else "—"
+    text_ = str(value).strip() if value is not None else ""
+    if not text_:
+        return "—"
+    return text_ if len(text_) <= 28 else text_[:27] + "…"
+
+
+def build_publish_review_kb(data):
+    rows = []
+    for idx, step in enumerate(PUBLISH_FIELDS):
+        value = data.get(step["key"])
+        empty = value in (None, "", [])
+        marker = "❗" if step["required"] and empty else ("▫️" if empty else "✅")
+        preview = _publish_field_preview(step, value)
+        label = f"{marker} {step.get('short', step['key'])}: {preview}"
+        rows.append([InlineKeyboardButton(label[:64], callback_data=f"pubf:{idx}")])
+    rows.append([InlineKeyboardButton("📤 نشر الآن", callback_data="pubpublish")])
+    rows.append([InlineKeyboardButton("❌ إلغاء النشر", callback_data="pubcancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def send_publish_review(bot, chat_id, st):
+    data = st.setdefault("publish_data", {})
+    st.pop("await", None)
+    st.pop("publish_edit_idx", None)
+    st.pop("publish_list_temp", None)
+    await bot.send_message(
+        chat_id,
+        "📋 بيانات التطبيق دلوقتي — دوس على أي حقل تعدله، وبعدين \"📤 نشر الآن\":",
+        reply_markup=build_publish_review_kb(data),
+    )
+
+
+async def edit_publish_review(query, st):
+    data = st.setdefault("publish_data", {})
+    st.pop("await", None)
+    st.pop("publish_edit_idx", None)
+    st.pop("publish_list_temp", None)
+    await query.edit_message_text(
+        "📋 بيانات التطبيق دلوقتي — دوس على أي حقل تعدله، وبعدين \"📤 نشر الآن\":",
+        reply_markup=build_publish_review_kb(data),
+    )
+
+
+async def handle_publish_field_tap(query, context, st, idx):
+    if idx < 0 or idx >= len(PUBLISH_FIELDS):
+        await edit_publish_review(query, st)
+        return
+    step  = PUBLISH_FIELDS[idx]
+    stype = step["type"]
+    st["publish_edit_idx"] = idx
+
+    back_row = [InlineKeyboardButton("◀️ رجوع من غير تعديل", callback_data="pubfback")]
 
     if stype == "choice":
-        rows = [[InlineKeyboardButton(disp, callback_data=f"pub:{step_idx}:{cidx}")]
+        rows = [[InlineKeyboardButton(disp, callback_data=f"pubfchoice:{idx}:{cidx}")]
                 for cidx, (_, disp) in enumerate(step["choices"])]
+        rows.append(back_row)
         st.pop("await", None)
-        await bot.send_message(chat_id, f"{label} {step['prompt']}", reply_markup=InlineKeyboardMarkup(rows))
+        await query.edit_message_text(step["prompt"], reply_markup=InlineKeyboardMarkup(rows))
         return
 
     if stype == "bool":
         rows = [[
-            InlineKeyboardButton("✅ نعم", callback_data=f"pub:{step_idx}:1"),
-            InlineKeyboardButton("❌ لا",  callback_data=f"pub:{step_idx}:0"),
-        ]]
+            InlineKeyboardButton("✅ نعم", callback_data=f"pubfbool:{idx}:1"),
+            InlineKeyboardButton("❌ لا",  callback_data=f"pubfbool:{idx}:0"),
+        ], back_row]
         st.pop("await", None)
-        await bot.send_message(chat_id, f"{label} {step['prompt']}", reply_markup=InlineKeyboardMarkup(rows))
+        await query.edit_message_text(step["prompt"], reply_markup=InlineKeyboardMarkup(rows))
         return
 
     if stype == "list_loop":
-        st["publish_list_temp"] = []
-        st["await"] = "publish_field_text"
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏭ تخطي", callback_data=f"pubskip:{step_idx}")]]) \
-            if not step["required"] else None
-        await bot.send_message(
-            chat_id,
-            f"{label} {step['prompt']}\n"
-            "(ابعت كل شرط في رسالة لوحده، وابعت \"تم\" لما تخلص، أو اضغط تخطي لو مفيش شروط)",
-            reply_markup=kb,
+        st["publish_list_temp"] = list(st["publish_data"].get(step["key"], []) or [])
+        st["await"] = "publish_field_edit"
+        rows = [[InlineKeyboardButton("🗑 امسح الكل", callback_data=f"pubfclear:{idx}")], back_row]
+        await query.edit_message_text(
+            f"{step['prompt']}\n(ابعت كل شرط في رسالة لوحده، وابعت \"تم\" لما تخلص)",
+            reply_markup=InlineKeyboardMarkup(rows),
         )
         return
 
-    skip_note = "" if step["required"] else "\n(اضغط \"⏭ تخطي\" أو ابعت \"-\")"
-    st["await"] = "publish_field_text"
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏭ تخطي", callback_data=f"pubskip:{step_idx}")]]) \
-        if not step["required"] else None
-    await bot.send_message(chat_id, f"{label} {step['prompt']}{skip_note}", reply_markup=kb)
+    st["await"] = "publish_field_edit"
+    rows = [[InlineKeyboardButton("🗑 امسح القيمة", callback_data=f"pubfclear:{idx}")], back_row]
+    await query.edit_message_text(step["prompt"], reply_markup=InlineKeyboardMarkup(rows))
 
 
-async def handle_publish_text_input(update, context, st, text):
-    step_idx = st.get("publish_step", 0)
-    if step_idx >= len(PUBLISH_FIELDS):
-        return
-    step  = PUBLISH_FIELDS[step_idx]
-    stype = step["type"]
-    bot   = context.bot
+async def handle_publish_field_text(update, context, st, text):
+    idx = st.get("publish_edit_idx")
     chat_id = update.effective_chat.id
+    if idx is None or idx < 0 or idx >= len(PUBLISH_FIELDS):
+        st.pop("await", None)
+        await send_publish_review(context.bot, chat_id, st)
+        return
+    step  = PUBLISH_FIELDS[idx]
+    stype = step["type"]
 
     if stype == "list_loop":
-        if text == "تم":
+        if text.strip() == "تم":
             st["publish_data"][step["key"]] = st.pop("publish_list_temp", [])
-            st["publish_step"] = step_idx + 1
-            st.pop("await", None)
-            await prompt_publish_step(bot, chat_id, st)
-            return
-        if text == "-" and not st.get("publish_list_temp"):
-            st["publish_data"][step["key"]] = []
-            st["publish_step"] = step_idx + 1
-            st.pop("await", None)
-            await prompt_publish_step(bot, chat_id, st)
+            await send_publish_review(context.bot, chat_id, st)
             return
         st.setdefault("publish_list_temp", []).append(text)
         await update.message.reply_text(f"✅ اتضاف ({len(st['publish_list_temp'])}). ابعت شرط تاني أو اكتب \"تم\":")
         return
 
-    if text == "-":
-        if step["required"]:
-            await update.message.reply_text("❌ الحقل ده إجباري، من فضلك اكتب قيمة:")
+    if stype == "float":
+        try:
+            value = float(text.replace(",", "."))
+        except ValueError:
+            await update.message.reply_text("❌ اكتب رقم صحيح (مثال: 4.3):")
             return
-        value = [] if stype == "multiline_list" else ("" if stype != "json" else None)
+    elif stype == "int":
+        try:
+            value = int(re.sub(r"[^\d]", "", text) or "0")
+        except ValueError:
+            await update.message.reply_text("❌ اكتب رقم صحيح:")
+            return
+    elif stype == "multiline_list":
+        value = [l.strip() for l in text.split("\n") if l.strip()][:8]
+    elif stype == "json":
+        try:
+            value = json.loads(text)
+        except Exception as e:
+            await update.message.reply_text(f"❌ صيغة JSON غلط:\n{e}\nحاول تاني:")
+            return
     else:
-        if stype == "float":
-            try:
-                value = float(text.replace(",", "."))
-            except ValueError:
-                await update.message.reply_text("❌ اكتب رقم صحيح (مثال: 4.3) أو \"-\" للتخطي:")
-                return
-        elif stype == "int":
-            try:
-                value = int(re.sub(r"[^\d]", "", text) or "0")
-            except ValueError:
-                await update.message.reply_text("❌ اكتب رقم صحيح أو \"-\" للتخطي:")
-                return
-        elif stype == "multiline_list":
-            value = [l.strip() for l in text.split("\n") if l.strip()][:8]
-        elif stype == "json":
-            try:
-                value = json.loads(text)
-            except Exception as e:
-                await update.message.reply_text(f"❌ صيغة JSON غلط:\n{e}\nحاول تاني أو ابعت \"-\" للتخطي:")
-                return
-        else:
-            value = text
-
-    if value is not None:
-        st["publish_data"][step["key"]] = value
-    st["publish_step"] = step_idx + 1
-    st.pop("await", None)
-    await prompt_publish_step(bot, chat_id, st)
-
-
-async def handle_publish_skip_callback(query, context, st, step_idx):
-    """معادلة ضغط زرار ⏭ تخطي لنفس منطق إرسال "-" في handle_publish_text_input."""
-    step = PUBLISH_FIELDS[step_idx]
-    if step["required"]:
-        await query.answer("❌ الحقل ده إجباري، من فضلك اكتب قيمة.", show_alert=True)
-        return
-
-    if step["type"] == "list_loop":
-        st["publish_data"][step["key"]] = st.pop("publish_list_temp", []) or []
-    elif step["type"] == "multiline_list":
-        st["publish_data"][step["key"]] = []
-    elif step["type"] == "json":
-        pass  # لا نحفظ قيمة للحقل خالص
-    else:
-        st["publish_data"][step["key"]] = ""
-
-    st["publish_step"] = step_idx + 1
-    st.pop("await", None)
-    await query.edit_message_text(f"{step['prompt']}\n⏭ اتخطى")
-    await prompt_publish_step(context.bot, query.message.chat_id, st)
-
-
-async def handle_publish_choice_callback(query, context, st, step_idx, val_raw):
-    step = PUBLISH_FIELDS[step_idx]
-    if step["type"] == "bool":
-        value   = (val_raw == "1")
-        display = "✅ نعم" if value else "❌ لا"
-    else:
-        cidx = int(val_raw)
-        value, display = step["choices"][cidx][0], step["choices"][cidx][1]
+        value = text.strip()
 
     st["publish_data"][step["key"]] = value
-    st["publish_step"] = step_idx + 1
-    await query.edit_message_text(f"{step['prompt']}\n➡️ {display}")
-    await prompt_publish_step(context.bot, query.message.chat_id, st)
+    await send_publish_review(context.bot, chat_id, st)
+
+
+async def handle_publish_clear_callback(query, context, st, idx):
+    step = PUBLISH_FIELDS[idx]
+    if step["type"] in ("multiline_list", "list_loop"):
+        st["publish_data"][step["key"]] = []
+    elif step["type"] == "bool":
+        st["publish_data"][step["key"]] = False
+    elif step["type"] == "json":
+        st["publish_data"].pop(step["key"], None)
+    else:
+        st["publish_data"][step["key"]] = ""
+    await edit_publish_review(query, st)
+
+
+async def handle_publish_choice_callback(query, context, st, idx, val_raw):
+    step = PUBLISH_FIELDS[idx]
+    if step["type"] == "bool":
+        value = (val_raw == "1")
+    else:
+        cidx = int(val_raw)
+        value = step["choices"][cidx][0]
+    st["publish_data"][step["key"]] = value
+    await edit_publish_review(query, st)
+
+
+async def handle_publish_finalize(query, context, st):
+    data = st.get("publish_data", {})
+    missing = [f.get("short", f["key"]) for f in PUBLISH_FIELDS
+               if f["required"] and not str(data.get(f["key"], "")).strip()]
+    if missing:
+        await query.answer("❗ لسه ناقص: " + "، ".join(missing), show_alert=True)
+        return
+    await query.edit_message_text("⏳ جاري نشر التطبيق...")
+    await finalize_publish(context.bot, query.message.chat_id, st)
 
 
 async def finalize_publish(bot, chat_id, st):
@@ -3274,19 +3324,30 @@ async def _handle_callback(query, context, uid, data, st):
         )
     elif data == "pubauto_no":
         await start_publish_flow(query, context, st)
-    elif data.startswith("pub:"):
-        _, step_idx_s, val_raw = data.split(":", 2)
-        step_idx = int(step_idx_s)
-        if step_idx != st.get("publish_step", -1):
-            await query.edit_message_text("⚠️ الخطوة دي قديمة أو خلصت، جرب تاني من القائمة.", reply_markup=main_menu_kb())
-            return
-        await handle_publish_choice_callback(query, context, st, step_idx, val_raw)
-    elif data.startswith("pubskip:"):
-        step_idx = int(data.split(":", 1)[1])
-        if step_idx != st.get("publish_step", -1):
-            await query.edit_message_text("⚠️ الخطوة دي قديمة أو خلصت، جرب تاني من القائمة.", reply_markup=main_menu_kb())
-            return
-        await handle_publish_skip_callback(query, context, st, step_idx)
+    elif data.startswith("pubfchoice:"):
+        _, idx_s, cidx_s = data.split(":", 2)
+        await handle_publish_choice_callback(query, context, st, int(idx_s), cidx_s)
+    elif data.startswith("pubfbool:"):
+        _, idx_s, val_s = data.split(":", 2)
+        await handle_publish_choice_callback(query, context, st, int(idx_s), val_s)
+    elif data.startswith("pubfclear:"):
+        idx = int(data.split(":", 1)[1])
+        await handle_publish_clear_callback(query, context, st, idx)
+    elif data == "pubfback":
+        await edit_publish_review(query, st)
+    elif data == "pubpublish":
+        await handle_publish_finalize(query, context, st)
+    elif data == "pubcancel":
+        st.pop("publish_data", None)
+        st.pop("publish_step", None)
+        st.pop("publish_list_temp", None)
+        st.pop("publish_edit_idx", None)
+        st.pop("await", None)
+        await query.edit_message_text("❌ اتلغى النشر.")
+        await context.bot.send_message(query.message.chat_id, "📋 القائمة الرئيسية:", reply_markup=main_menu_kb())
+    elif data.startswith("pubf:"):
+        idx = int(data.split(":", 1)[1])
+        await handle_publish_field_tap(query, context, st, idx)
     elif data == "confirm_insert":
         await query.edit_message_text("⏳ جاري الإضافة...")
         result = await asyncio.to_thread(
