@@ -2335,12 +2335,16 @@ async def start_search_filename_flow(query, st):
 
 def replace_files_by_name_sync(project_dir, incoming_paths: dict):
     """incoming_paths: dict {اسم الملف: مسار الملف على الديسك}. بيدور جوه
-    المشروع على أي ملف بنفس الاسم بالظبط (في أي مكان)، ولو لقاه يستبدله
-    (مع نسخة احتياطية من القديم)، ولو مالقاش يتخطاه. بيرجّع (replaced, skipped)."""
+    المشروع على أي ملف بنفس الاسم (المطابقة هنا case-insensitive، يعني لو
+    بعت ملف اسمه "pI" هيلاقي ويستبدل ملف اسمه "pi" في المشروع من غير ما
+    يشتكي)، ولو لقاه يستبدله محتفظًا باسم الملف الأصلي جوه المشروع زي ما هو
+    بالظبط (الكابيتال/السمول بتاعت الملف اللي في المشروع مبتتغيرش، بس
+    المحتوى بس اللي بيتستبدل) — مع نسخة احتياطية من القديم. لو مالقاش
+    يتخطاه. بيرجّع (replaced, skipped)."""
     name_to_paths = {}
     for root_dir, _, filenames in os.walk(project_dir):
         for fn in filenames:
-            name_to_paths.setdefault(fn, []).append(
+            name_to_paths.setdefault(fn.lower(), []).append(
                 os.path.relpath(os.path.join(root_dir, fn), project_dir)
             )
 
@@ -2349,7 +2353,7 @@ def replace_files_by_name_sync(project_dir, incoming_paths: dict):
     skipped  = []  # [filename]
 
     for fname, local_path in incoming_paths.items():
-        rel_list = name_to_paths.get(fname)
+        rel_list = name_to_paths.get(fname.lower())
         if not rel_list:
             skipped.append(fname)
             continue
