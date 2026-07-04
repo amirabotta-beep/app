@@ -1253,6 +1253,7 @@ def main_menu_kb():
         [InlineKeyboardButton("🖊 تجميع وتوقيع", callback_data="menu_build")],
         [InlineKeyboardButton("🔍 بحث واستبدال smali", callback_data="menu_search")],
         [InlineKeyboardButton("📄 استبدال ملف/ملفات بالاسم (تلقائي)", callback_data="menu_search_filename")],
+        [InlineKeyboardButton("📍 استبدال ملف بمسار محدد (يدوي)", callback_data="menu_path_replace")],
         [InlineKeyboardButton("📤 نشر تطبيق على الموقع", callback_data="menu_publish_app")],
         [InlineKeyboardButton("📦 نقل classes.zip", callback_data="menu_classes")],
         [InlineKeyboardButton("🔑 إدارة شهادات التوقيع", callback_data="menu_keystores")],
@@ -1352,6 +1353,25 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st["new_ks_path"] = dest
         st["await"]       = "keystore_alias"
         await update.message.reply_text("✅ تم استلام ملف الـ keystore.\n✍️ دلوقتي اكتب الـ Alias:")
+        return
+
+    if st.get("await") == "path_replace_upload":
+        target_rel = st.get("path_replace_target")
+        st.pop("await", None)
+        st.pop("path_replace_target", None)
+        if not target_rel or not os.path.isdir(PROJECT_DIR):
+            await update.message.reply_text("❌ حصل خطأ (المسار مش متاح دلوقتي)، جرب تاني من القائمة.", reply_markup=main_menu_kb())
+            return
+
+        tmp_dir = os.path.join(WORKSPACE_DIR, f"pathreplace_{random_string(6)}")
+        os.makedirs(tmp_dir, exist_ok=True)
+        tmp_path = os.path.join(tmp_dir, doc.file_name or "file")
+        f = await doc.get_file()
+        await f.download_to_drive(tmp_path)
+
+        result = await asyncio.to_thread(replace_file_sync, PROJECT_DIR, target_rel, tmp_path)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        await update.message.reply_text(result, reply_markup=main_menu_kb())
         return
 
     if st.get("await") == "filename_replace_upload":
@@ -1474,6 +1494,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st       = get_state(uid)
     awaiting = st.get("await")
     text     = update.message.text.strip()
+
+    if awaiting == "path_replace_query":
+        await handle_path_replace_query(update, st, text)
+        return
 
     if awaiting == "new_github_token":
         new_token = text
@@ -2423,6 +2447,99 @@ def format_fnreplace_prompt(fname, rel_paths):
         lines.append(f"{i + 1}️⃣ {rel}")
     lines.append("\n👇 اختار رقم المكان اللي عايز تستبدل الملف فيه بالظبط — هيتم الاستبدال في هذا المكان فقط، ومفيش أي تعديل تاني.")
     return "\n".join(lines)
+
+
+# =============================================================================
+# استبدال ملف بمسار محدد (يدوي) — بديل عن البحث بالاسم لما يكون فيه كتير
+# ─────────────────────────────────────────────────────────────────────────
+# ملفات بنفس الاسم في المشروع. المستخدم بيكتب مسار أو جزء منه (مثلاً
+# "bykvm_short06/b")، البوت بيدور جوه المشروع على أي مسار نسبي يحتوي على
+# النص ده، ولو النتايج قليلة يسيبه يحدد المكان بالظبط، وبعدين يبعت الملف
+# فيتم وضعه في هذا المكان بالضبط. الفرق عن "استبدال بالاسم" إن البحث هنا
+# بيتم بالمسار (الفولدر + الاسم) مش بالاسم لوحده، فبيقلل عدد النتائج
+# جدًا ويمنع مشكلة كتر الأزرار اللي كانت بتسبب فشل/انقطاع من تليجرام.
+# =============================================================================
+PATH_REPLACE_MAX_RESULTS = 25  # سقف عدد الأزرار المسموح عرضها دفعة واحدة
+
+
+def find_path_matches_sync(project_dir, query_text):
+    """يرجّع لستة كل المسارات النسبية داخل المشروع اللي بتحتوي على
+    query_text (مطابقة جزئية، case-insensitive)، بترتيب أبجدي."""
+    q = query_text.strip().lower().replace("\\", "/")
+    results = []
+    for root_dir, _, filenames in os.walk(project_dir):
+        for fn in filenames:
+            full = os.path.join(root_dir, fn)
+            rel = os.path.relpath(full, project_dir).replace("\\", "/")
+            if q in rel.lower():
+                results.append(rel)
+    results.sort()
+    return results
+
+
+def build_pathpick_kb(rel_paths):
+    rows = []
+    for i, rel in enumerate(rel_paths):
+        label = f"{i + 1}️⃣ {rel}"
+        if len(label) > 60:
+            label = label[:57] + "..."
+        rows.append([InlineKeyboardButton(label, callback_data=f"pathpick:{i}")])
+    rows.append([InlineKeyboardButton("⬅️ رجوع", callback_data="back_main")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def start_path_replace_flow(query, st):
+    if not os.path.isdir(PROJECT_DIR):
+        await query.edit_message_text("❌ لا يوجد مشروع مفكوك حالياً.", reply_markup=main_menu_kb())
+        return
+    st["await"] = "path_replace_query"
+    await query.edit_message_text(
+        "📍 اكتب المسار (أو جزء منه) بتاع الملف اللي عايز تستبدله جوه المشروع.\n\n"
+        "مثال: bykvm_short06/b\n\n"
+        "هدور على كل مسار فيه النص ده، ولو المسار محدد بالظبط ومفيهوش لبس هبدأ "
+        "أطلب منك الملف على طول."
+    )
+
+
+async def handle_path_replace_query(update, st, text):
+    """بعد ما المستخدم يكتب المسار/جزء منه، بندور جوه المشروع ونحدد الخطوة
+    اللي بعدها حسب عدد النتائج."""
+    if not os.path.isdir(PROJECT_DIR):
+        st.pop("await", None)
+        await update.message.reply_text("❌ لا يوجد مشروع مفكوك حالياً.", reply_markup=main_menu_kb())
+        return
+
+    matches = await asyncio.to_thread(find_path_matches_sync, PROJECT_DIR, text)
+
+    if not matches:
+        await update.message.reply_text(
+            "❌ مفيش أي ملف بمسار فيه النص ده. جرب تاكتب مسار تاني أو جزء أدق منه:"
+        )
+        return  # سيبه على awaiting == path_replace_query عشان يجرب تاني
+
+    if len(matches) == 1:
+        st["path_replace_target"] = matches[0]
+        st["await"] = "path_replace_upload"
+        await update.message.reply_text(
+            f"✅ لقيت مسار واحد بالظبط:\n📄 {matches[0]}\n\n"
+            "دلوقتي ابعت الملف اللي عايز تستبدله بيه:"
+        )
+        return
+
+    if len(matches) > PATH_REPLACE_MAX_RESULTS:
+        await update.message.reply_text(
+            f"⚠️ النص ده موجود في {len(matches)} مكان، ده كتير عشان أعرضهولك في أزرار.\n"
+            "اكتب مسار أكثر تحديدًا (مثلاً ضيف اسم الفولدر كامل):"
+        )
+        return  # سيبه على awaiting == path_replace_query عشان يضيّق البحث
+
+    st.pop("await", None)
+    st["path_replace_candidates"] = matches
+    lines = [f"🔎 النص ده موجود في {len(matches)} مكان:\n"]
+    for i, rel in enumerate(matches):
+        lines.append(f"{i + 1}️⃣ {rel}")
+    lines.append("\n👇 اختار المكان بالظبط:")
+    await update.message.reply_text("\n".join(lines), reply_markup=build_pathpick_kb(matches))
 
 
 def finalize_fnreplace_report(st):
@@ -3409,6 +3526,31 @@ async def _handle_callback(query, context, uid, data, st):
     elif data == "menu_search_filename":
         await start_search_filename_flow(query, st)
 
+    # ── استبدال ملف بمسار محدد (يدوي) ──
+    elif data == "menu_path_replace":
+        await start_path_replace_flow(query, st)
+
+    # ── تحديد المكان بالظبط من نتايج البحث بالمسار ──
+    elif data.startswith("pathpick:"):
+        candidates = st.get("path_replace_candidates")
+        if not candidates:
+            await query.edit_message_text("❌ حصل خطأ (الطلب ده مش متاح دلوقتي)، جرب تاني من القائمة.", reply_markup=main_menu_kb())
+            return
+        try:
+            idx = int(data.split(":", 1)[1])
+        except ValueError:
+            idx = -1
+        if idx < 0 or idx >= len(candidates):
+            await query.edit_message_text("❌ حصل خطأ، جرب تاني من القائمة.", reply_markup=main_menu_kb())
+            return
+        st.pop("path_replace_candidates", None)
+        st["path_replace_target"] = candidates[idx]
+        st["await"] = "path_replace_upload"
+        await query.edit_message_text(
+            f"✅ تم تحديد المسار:\n📄 {candidates[idx]}\n\n"
+            "دلوقتي ابعت الملف اللي عايز تستبدله بيه:"
+        )
+
     # ── تحديد المكان بالظبط لما اسم الملف يكون موجود في أكتر من فولدر ──
     elif data.startswith("fnpick:"):
         sel = data.split(":", 1)[1]
@@ -3763,3 +3905,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
