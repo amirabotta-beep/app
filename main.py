@@ -1387,26 +1387,41 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             incoming[doc.file_name or "file"] = tmp_path
 
-        replaced, skipped = await asyncio.to_thread(replace_files_by_name_sync, PROJECT_DIR, incoming)
-        shutil.rmtree(tmp_dir, ignore_errors=True)
         st.pop("await", None)
 
-        lines = []
-        if replaced:
-            lines.append(f"✅ اتبدل ({len(replaced)}):")
-            for fname, paths in replaced:
-                if len(paths) == 1:
-                    lines.append(f"• {fname} ← {paths[0]}")
-                else:
-                    lines.append(f"• {fname} ← {len(paths)} أماكن:")
-                    lines.extend(f"    - {p}" for p in paths)
-        if skipped:
-            lines.append(f"\n⏭ اتخطى (مفيش ملف بنفس الاسم في المشروع) ({len(skipped)}):")
-            lines.extend(f"• {fname}" for fname in skipped)
-        if not lines:
-            lines.append("⚠️ الملف ده مكانش فيه أي حاجة قدرت أستبدلها.")
+        # ── بحث فقط (من غير أي تعديل) عن مكان كل اسم ملف داخل المشروع ──
+        matches = await asyncio.to_thread(find_filename_matches_sync, PROJECT_DIR, incoming)
 
-        await update.message.reply_text(tail_log("\n".join(lines), 3500), reply_markup=main_menu_kb())
+        report = {"replaced": [], "skipped": []}
+        queue = []  # الملفات اللي اسمها موجود في أكتر من مكان، وعايزة تحديد يدوي
+        for fname, local_path in incoming.items():
+            rel_list = matches.get(fname, [])
+            if not rel_list:
+                report["skipped"].append((fname, "مفيش ملف بنفس الاسم في المشروع"))
+            elif len(rel_list) == 1:
+                # مكان واحد بس بنفس الاسم → مفيش لبس، استبدال مباشر
+                result = await asyncio.to_thread(replace_file_sync, PROJECT_DIR, rel_list[0], local_path)
+                if result.startswith("✅"):
+                    report["replaced"].append((fname, rel_list[0]))
+                else:
+                    report["skipped"].append((fname, "فشل الاستبدال"))
+            else:
+                # الاسم ده موجود في أكتر من مكان → لازم تحدد إنت أنهي مكان بالظبط
+                queue.append({"fname": fname, "local_path": local_path, "rel_paths": rel_list})
+
+        st["fnreplace_report"]  = report
+        st["fnreplace_queue"]   = queue
+        st["fnreplace_tmp_dir"] = tmp_dir
+
+        if queue:
+            item = queue[0]
+            st["fnreplace_current"] = item
+            await update.message.reply_text(
+                format_fnreplace_prompt(item["fname"], item["rel_paths"]),
+                reply_markup=build_fnreplace_kb(item["rel_paths"]),
+            )
+        else:
+            await update.message.reply_text(finalize_fnreplace_report(st), reply_markup=main_menu_kb())
         return
 
     if name.endswith(".apk"):
@@ -2374,6 +2389,68 @@ def replace_files_by_name_sync(project_dir, incoming_paths: dict):
     return replaced, skipped
 
 
+def find_filename_matches_sync(project_dir, incoming_paths: dict):
+    """بحث فقط (من غير أي استبدال أو تعديل فعلي) — بيدور جوه المشروع على
+    كل اسم ملف من incoming_paths (مطابقة case-insensitive) وبيرجّع
+    dict {اسم الملف: [كل الأماكن (مسارات نسبية) اللي لقاها بنفس الاسم]}.
+    لو الاسم مش موجود خالص، القيمة بتكون [] (لستة فاضية)."""
+    name_to_paths = {}
+    for root_dir, _, filenames in os.walk(project_dir):
+        for fn in filenames:
+            name_to_paths.setdefault(fn.lower(), []).append(
+                os.path.relpath(os.path.join(root_dir, fn), project_dir)
+            )
+    return {fname: name_to_paths.get(fname.lower(), []) for fname in incoming_paths}
+
+
+def build_fnreplace_kb(rel_paths):
+    """أزرار مرقّمة لكل مكان لقينا فيه الاسم، عشان المستخدم يحدد المكان
+    المطلوب بالظبط بضغطة واحدة (1، 2، 3، ...)، بدون ما نستبدل أي حاجة
+    تانية غير المكان ده."""
+    rows = []
+    for i, rel in enumerate(rel_paths):
+        label = f"{i + 1}️⃣ {rel}"
+        if len(label) > 60:
+            label = label[:57] + "..."
+        rows.append([InlineKeyboardButton(label, callback_data=f"fnpick:{i}")])
+    rows.append([InlineKeyboardButton("⏭ تخطي هذا الملف (بدون استبدال)", callback_data="fnpick:skip")])
+    return InlineKeyboardMarkup(rows)
+
+
+def format_fnreplace_prompt(fname, rel_paths):
+    lines = [f"📄 الملف \"{fname}\" موجود في {len(rel_paths)} مكان مختلف داخل المشروع:\n"]
+    for i, rel in enumerate(rel_paths):
+        lines.append(f"{i + 1}️⃣ {rel}")
+    lines.append("\n👇 اختار رقم المكان اللي عايز تستبدل الملف فيه بالظبط — هيتم الاستبدال في هذا المكان فقط، ومفيش أي تعديل تاني.")
+    return "\n".join(lines)
+
+
+def finalize_fnreplace_report(st):
+    """يبني نص التقرير النهائي بعد ما يخلص كل الملفات (المباشرة تلقائيًا +
+    اللي اتحددت يدويًا)، وينظف مجلد التحميل المؤقت وحالة الطابور."""
+    report = st.pop("fnreplace_report", {"replaced": [], "skipped": []})
+    tmp_dir = st.pop("fnreplace_tmp_dir", None)
+    st.pop("fnreplace_queue", None)
+    st.pop("fnreplace_current", None)
+    if tmp_dir:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    lines = []
+    replaced = report.get("replaced", [])
+    skipped  = report.get("skipped", [])
+    if replaced:
+        lines.append(f"✅ اتبدل ({len(replaced)}):")
+        for fname, rel in replaced:
+            lines.append(f"• {fname} ← {rel}")
+    if skipped:
+        lines.append(f"\n⏭ اتخطى ({len(skipped)}):")
+        for fname, reason in skipped:
+            lines.append(f"• {fname} ({reason})")
+    if not lines:
+        lines.append("⚠️ الملف ده مكانش فيه أي حاجة قدرت أستبدلها.")
+    return tail_log("\n".join(lines), 3500)
+
+
 # =============================================================================
 # نشر تطبيق على الموقع (نفس حقول فورم "إضافة تطبيق" في صفحة الأدمن بالظبط)
 # =============================================================================
@@ -3331,6 +3408,48 @@ async def _handle_callback(query, context, uid, data, st):
     # ── استبدال ملف/ملفات بمطابقة الاسم تلقائي ──
     elif data == "menu_search_filename":
         await start_search_filename_flow(query, st)
+
+    # ── تحديد المكان بالظبط لما اسم الملف يكون موجود في أكتر من فولدر ──
+    elif data.startswith("fnpick:"):
+        sel = data.split(":", 1)[1]
+        item = st.get("fnreplace_current")
+        queue = st.get("fnreplace_queue", [])
+        if not item or not queue or queue[0] is not item:
+            await query.edit_message_text("❌ حصل خطأ (الطلب ده مش متاح دلوقتي)، جرب تاني من القائمة.", reply_markup=main_menu_kb())
+            return
+
+        report = st.get("fnreplace_report", {"replaced": [], "skipped": []})
+        if sel == "skip":
+            report["skipped"].append((item["fname"], "تخطي يدوي"))
+        else:
+            try:
+                idx = int(sel)
+            except ValueError:
+                idx = -1
+            rel_paths = item["rel_paths"]
+            if idx < 0 or idx >= len(rel_paths):
+                await query.edit_message_text("❌ حصل خطأ، جرب تاني من القائمة.", reply_markup=main_menu_kb())
+                return
+            target_rel = rel_paths[idx]
+            result = await asyncio.to_thread(replace_file_sync, PROJECT_DIR, target_rel, item["local_path"])
+            if result.startswith("✅"):
+                report["replaced"].append((item["fname"], target_rel))
+            else:
+                report["skipped"].append((item["fname"], "فشل الاستبدال"))
+
+        st["fnreplace_report"] = report
+        queue.pop(0)
+        st["fnreplace_queue"] = queue
+
+        if queue:
+            next_item = queue[0]
+            st["fnreplace_current"] = next_item
+            await query.edit_message_text(
+                format_fnreplace_prompt(next_item["fname"], next_item["rel_paths"]),
+                reply_markup=build_fnreplace_kb(next_item["rel_paths"]),
+            )
+        else:
+            await query.edit_message_text(finalize_fnreplace_report(st), reply_markup=main_menu_kb())
 
     # ── نشر تطبيق على الموقع ──
     elif data == "menu_publish_app":
