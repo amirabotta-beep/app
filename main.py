@@ -163,6 +163,15 @@ DEFAULT_CONFIG = {
     # "ownerUid" عشان يتوافق مع قواعد أمان Firestore اللي بتتحقق من
     # request.auth.uid. تقدر تحدّثه من زرار "🆔 تحديث User UID" في القائمة.
     "firebase_owner_uid"      : "",
+    # ── نشر إعلان التطبيق في قناة تيليجرام بعد نشره على الموقع ────────────────
+    # telegram_channel_id: آيدي أو يوزر القناة اللي البوت أدمن فيها، مثال:
+    # "@my_channel" أو "-1001234567890". لازم تضيف البوت أدمن في القناة
+    # وتديله صلاحية "نشر رسائل" (Post Messages) عشان يقدر يبعت فيها.
+    "telegram_channel_id"     : "",
+    # site_app_page_url: رابط صفحة عرض التطبيق على موقعك (بدون الـ query
+    # string)، وهيتضاف له "?app=<packageId بعد استبدال النقط بشرطات>"
+    # تلقائيًا. مثال: https://volttechcode.github.io/web/app-page.html
+    "site_app_page_url"       : "https://volttechcode.github.io/web/app-page.html",
 }
 
 
@@ -184,6 +193,7 @@ def load_config():
     # فاضي من الأسرار الحقيقية وميبقاش خطر لو اترفع لـ Git بالغلط.
     cfg["bot_token"]    = os.environ.get("BOT_TOKEN", cfg.get("bot_token", ""))
     cfg["github_token"] = os.environ.get("GITHUB_TOKEN", cfg.get("github_token", ""))
+    cfg["telegram_channel_id"] = os.environ.get("TELEGRAM_CHANNEL_ID", cfg.get("telegram_channel_id", ""))
     cfg["firebase_admin_email"]    = os.environ.get("FIREBASE_ADMIN_EMAIL", cfg.get("firebase_admin_email", ""))
     cfg["firebase_admin_password"] = os.environ.get("FIREBASE_ADMIN_PASSWORD", cfg.get("firebase_admin_password", ""))
     cfg["firebase_owner_uid"]      = os.environ.get("FIREBASE_OWNER_UID", cfg.get("firebase_owner_uid", ""))
@@ -3292,7 +3302,17 @@ async def finalize_publish(bot, chat_id, st):
         await bot.send_message(
             chat_id,
             f"✅ تم نشر التطبيق بنجاح على الموقع!\n📄 اسم: {name}\n🆔 معرّف المستند: `{result}`",
-            reply_markup=main_menu_kb(),
+        )
+        # نحفظ بيانات التطبيق ده عشان لو الأدمن قرر ينشره في قناة تيليجرام كمان
+        st["last_published_app"] = dict(app_data)
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 انشر في القناة", callback_data="chpub_yes")],
+            [InlineKeyboardButton("❌ لأ، خلاص كفاية", callback_data="chpub_no")],
+        ])
+        await bot.send_message(
+            chat_id,
+            "📢 عايز تنشر التطبيق ده في قناة تيليجرام كمان؟",
+            reply_markup=kb,
         )
     else:
         await bot.send_message(chat_id, result, reply_markup=main_menu_kb())
@@ -3326,6 +3346,101 @@ def _publish_write_sync(fields: dict) -> tuple[bool, str]:
     doc_name = r.json().get("name", "")
     doc_id   = doc_name.rstrip("/").split("/")[-1] if doc_name else ""
     return True, doc_id
+
+
+# =============================================================================
+# نشر إعلان التطبيق في قناة تيليجرام (بعد ما يتنشر على الموقع)
+# =============================================================================
+def _CATEGORY_LABELS():
+    return {c[0]: c[1] for step in PUBLISH_FIELDS if step["key"] == "category" for c in step["choices"]}
+
+
+def build_site_app_url(app_data: dict) -> str:
+    """يبني رابط صفحة التطبيق على الموقع من packageId (بعد استبدال النقط
+    بشرطات)، وإن ملقيهوش يرجع لـ seoSlug كبديل."""
+    base = (CFG.get("site_app_page_url") or "").strip().rstrip("?")
+    pkg = (app_data.get("packageId") or "").strip()
+    slug = pkg.replace(".", "-") if pkg else (app_data.get("seoSlug") or "").strip()
+    if not base or not slug:
+        return ""
+    return f"{base}?app={slug}"
+
+
+def build_channel_message(app_data: dict, site_url: str) -> str:
+    name  = app_data.get("name", "").strip()
+    dev   = app_data.get("developer", "").strip()
+    cat   = _CATEGORY_LABELS().get(app_data.get("category", ""), app_data.get("category", ""))
+    desc  = (app_data.get("description") or "").strip()
+    if len(desc) > 300:
+        desc = desc[:300].rstrip() + "…"
+    rating = app_data.get("rating") or 0
+    rcount = app_data.get("ratingCount") or 0
+    size   = (app_data.get("size") or "").strip()
+    installs = (app_data.get("installs") or "").strip()
+    version  = (app_data.get("version") or "").strip()
+
+    lines = [f"📱 <b>{_html_lib.escape(name)}</b>"]
+    if dev:
+        lines.append(f"👨‍💻 المطور: {_html_lib.escape(dev)}")
+    if cat:
+        lines.append(f"📂 التصنيف: {_html_lib.escape(str(cat))}")
+    extra = []
+    if rating:
+        extra.append(f"⭐ {rating}" + (f" ({rcount:,})" if rcount else ""))
+    if size:
+        extra.append(f"📦 {size}")
+    if installs:
+        extra.append(f"📥 {installs}")
+    if version:
+        extra.append(f"🔢 v{version}")
+    if extra:
+        lines.append(" | ".join(extra))
+    if desc:
+        lines.append("")
+        lines.append(_html_lib.escape(desc))
+    lines.append("")
+    lines.append(f"⬇️ للتحميل: {site_url}")
+    return "\n".join(lines)
+
+
+async def post_app_to_channel(bot, app_data: dict) -> tuple[bool, str]:
+    channel_id = (CFG.get("telegram_channel_id") or "").strip()
+    if not channel_id:
+        return False, "❌ آيدي قناة التيليجرام مش متظبط في الإعدادات (telegram_channel_id)."
+
+    site_url = build_site_app_url(app_data)
+    if not site_url:
+        return False, "❌ مقدرتش أبني رابط صفحة التطبيق على الموقع (تأكد من site_app_page_url و Package ID)."
+
+    caption = build_channel_message(app_data, site_url)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ تحميل التطبيق", url=site_url)]])
+
+    photo_url = (app_data.get("headerImage") or "").strip() or (app_data.get("icon") or "").strip()
+    if not photo_url.lower().startswith(("http://", "https://")):
+        photo_url = ""
+
+    try:
+        if photo_url:
+            try:
+                await bot.send_photo(
+                    chat_id=channel_id, photo=photo_url, caption=caption,
+                    parse_mode="HTML", reply_markup=kb,
+                )
+            except Exception:
+                # لو الصورة فشلت (رابط باظ مثلًا) نبعت رسالة نصية عادية بدالها
+                await bot.send_message(
+                    chat_id=channel_id, text=caption,
+                    parse_mode="HTML", reply_markup=kb, disable_web_page_preview=False,
+                )
+        else:
+            await bot.send_message(
+                chat_id=channel_id, text=caption,
+                parse_mode="HTML", reply_markup=kb, disable_web_page_preview=False,
+            )
+    except Exception as e:
+        return False, f"❌ فشل النشر في القناة: {e}"
+
+    return True, "✅ اتنشر في القناة بنجاح!"
 
 
 # =============================================================================
@@ -3772,6 +3887,22 @@ async def _handle_callback(query, context, uid, data, st):
     elif data.startswith("pubf:"):
         idx = int(data.split(":", 1)[1])
         await handle_publish_field_tap(query, context, st, idx)
+
+    # ── نشر التطبيق (اللي اتنشر لسه على الموقع) في قناة تيليجرام ──
+    elif data == "chpub_yes":
+        app_data = st.get("last_published_app")
+        if not app_data:
+            await query.edit_message_text("❌ مفيش تطبيق محفوظ حاليًا عشان أنشره في القناة.", reply_markup=main_menu_kb())
+            return
+        await query.edit_message_text("⏳ جاري النشر في القناة...")
+        ok, msg = await post_app_to_channel(context.bot, app_data)
+        await context.bot.send_message(query.message.chat_id, msg, reply_markup=main_menu_kb())
+        if ok:
+            st.pop("last_published_app", None)
+    elif data == "chpub_no":
+        st.pop("last_published_app", None)
+        await query.edit_message_text("👌 تمام، مش هينشر في القناة.")
+        await context.bot.send_message(query.message.chat_id, "📋 القائمة الرئيسية:", reply_markup=main_menu_kb())
     elif data == "confirm_insert":
         await query.edit_message_text("⏳ جاري الإضافة...")
         result = await asyncio.to_thread(
