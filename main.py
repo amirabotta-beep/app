@@ -2643,6 +2643,13 @@ def _publish_slugify(text_):
 # =============================================================================
 import html as _html_lib
 
+try:
+    from google_play_scraper import app as _gplay_app_fetch
+    _GPLAY_AVAILABLE = True
+except ImportError:
+    _gplay_app_fetch = None
+    _GPLAY_AVAILABLE = False
+
 _AR_MONTHS = {
     "يناير": 1, "فبراير": 2, "مارس": 3, "أبريل": 4, "ابريل": 4, "مايو": 5,
     "يونيو": 6, "يوليو": 7, "أغسطس": 8, "اغسطس": 8, "سبتمبر": 9,
@@ -2709,12 +2716,137 @@ def _guess_category(raw_category_text: str) -> str:
     return ""
 
 
+def _boost_play_image_quality(img_url: str) -> str:
+    """
+    صور Google Play (أيقونة/ترويسة/لقطات شاشة) بتتخزن على play-lh.googleusercontent.com
+    وبييجي في آخر الرابط جزء بيحدد الحجم زي "=w526-h296-rw" وده بيرجع نسخة
+    مضغوطة صغيرة. لو شلنا الجزء ده وحطينا بدل منه "=s0" جوجل بترجع الصورة
+    بأعلى دقة متاحة (الحجم الأصلي)، وده بيشتغل مع أي صورة على googleusercontent.com.
+    """
+    if not img_url:
+        return img_url
+    base = img_url.split("=")[0]
+    return f"{base}=s0"
+
+
+def scrape_app_info_from_google_play(url: str) -> dict:
+    """
+    يجيب بيانات تطبيق مباشرة من Google Play Store (مش سكرابينج HTML يدوي —
+    بنستخدم مكتبة google-play-scraper اللي بتتعامل مع الـ API الداخلي بتاع
+    المتجر، فالبيانات بتطلع دقيقة ومنظمة، ولقطات الشاشة/الأيقونة بترجع
+    بأعلى جودة ممكنة عن طريق _boost_play_image_quality).
+    """
+    out = {}
+
+    m = re.search(r"[?&]id=([a-zA-Z0-9_.]+)", url)
+    if not m:
+        return {"_error": (
+            "❌ الرابط ده مش رابط تطبيق سليم من Google Play.\n"
+            "لازم يكون بالشكل ده ويحتوي على ?id=...، مثال:\n"
+            "https://play.google.com/store/apps/details?id=com.whatsapp"
+        )}
+    app_id = m.group(1)
+
+    lang_m = re.search(r"[?&]hl=([a-zA-Z\-]+)", url)
+    lang = lang_m.group(1) if lang_m else "ar"
+    gl_m = re.search(r"[?&]gl=([a-zA-Z]+)", url)
+    country = gl_m.group(1) if gl_m else "eg"
+
+    if not _GPLAY_AVAILABLE:
+        return {"_error": (
+            "❌ مكتبة google-play-scraper مش متثبتة على السيرفر.\n"
+            "ثبّتها بالأمر:\npip install google-play-scraper\n"
+            "وبعدين شغّل البوت تاني."
+        )}
+
+    try:
+        data = _gplay_app_fetch(app_id, lang=lang, country=country)
+    except Exception as e:
+        return {"_error": f"فشل جلب بيانات التطبيق من Google Play:\n{e}"}
+
+    # ── الاسم والمطور ──
+    if data.get("title"):
+        out["name"] = data["title"].strip()
+    if data.get("developer"):
+        out["developer"] = data["developer"].strip()
+
+    # ── Package ID ──
+    out["packageId"] = data.get("appId") or app_id
+
+    # ── الأيقونة وصورة الترويسة (بأعلى جودة) ──
+    if data.get("icon"):
+        out["icon"] = _boost_play_image_quality(data["icon"])
+    if data.get("headerImage"):
+        out["headerImage"] = _boost_play_image_quality(data["headerImage"])
+
+    # ── لقطات الشاشة (بأعلى جودة، لحد 8) ──
+    shots = data.get("screenshots") or []
+    if shots:
+        out["screenshots"] = [_boost_play_image_quality(s) for s in shots[:8]]
+
+    # ── الوصف ──
+    if data.get("description"):
+        out["description"] = data["description"].strip()
+
+    # ── التصنيف ──
+    mapped_cat = _guess_category(data.get("genre", ""))
+    if mapped_cat:
+        out["category"] = mapped_cat
+
+    # ── التقييم وعدد التقييمات ──
+    if data.get("score") is not None:
+        try:
+            out["rating"] = round(float(data["score"]), 1)
+        except (TypeError, ValueError):
+            pass
+    if data.get("ratings") is not None:
+        try:
+            out["ratingCount"] = int(data["ratings"])
+        except (TypeError, ValueError):
+            pass
+
+    # ── عدد التنزيلات ──
+    if data.get("installs"):
+        out["installs"] = data["installs"].strip()
+
+    # ── الحجم ──
+    if data.get("size"):
+        out["size"] = data["size"].strip()
+
+    # ── رقم الإصدار ──
+    if data.get("version") and data["version"].lower() != "varies with device":
+        out["version"] = data["version"].strip()
+
+    # ── أقل إصدار أندرويد ──
+    andv = data.get("androidVersion") or ""
+    andv_m = re.search(r"(\d+(?:\.\d+)?)", andv)
+    if andv_m:
+        out["androidVersion"] = andv_m.group(1)
+
+    # ── التصنيف العمري ──
+    if data.get("contentRating"):
+        out["contentRating"] = data["contentRating"].strip()
+
+    # ── تاريخ الإصدار الأصلي ──
+    release_date = _parse_arabic_or_english_date(data.get("released") or "")
+    if release_date:
+        out["releaseDate"] = release_date
+
+    # ── إعلانات ──
+    if data.get("adSupported") is not None:
+        out["adSupported"] = bool(data["adSupported"])
+
+    return out
+
+
 def scrape_app_info_sync(url: str) -> dict:
     """
-    يجيب بيانات تطبيق من صفحته (Uptodown أو أي صفحة مشابهة فيها meta tags
-    عادية) ويرجع dict بمفاتيح زي مفاتيح PUBLISH_FIELDS — أي حقل ملقاهوش
-    ببساطة بيتسيب من غير ما يتحط في الـ dict خالص.
+    يجيب بيانات تطبيق من رابط صفحته. لو الرابط من Google Play Store بيستخدم
+    google-play-scraper (أدق وأعلى جودة صور)، ولو من أي موقع تاني (زي
+    Uptodown) بيرجع لطريقة meta tags القديمة.
     """
+    if "play.google.com" in url.lower():
+        return scrape_app_info_from_google_play(url)
     out = {}
     try:
         r = requests.get(
@@ -3601,18 +3733,18 @@ async def _handle_callback(query, context, uid, data, st):
         ])
         await query.edit_message_text(
             "📤 نشر تطبيق جديد على الموقع\n\n"
-            "عايز تملي الحقول أوتوماتيك من رابط صفحة تطبيق (زي Uptodown)، "
+            "عايز تملي الحقول أوتوماتيك من رابط صفحة التطبيق على Google Play، "
             "ولا هتكتب البيانات بنفسك؟",
             reply_markup=kb,
         )
     elif data == "pubauto_yes":
         st["await"] = "publish_autofill_url"
         await query.edit_message_text(
-            "🔗 ابعت رابط صفحة التطبيق دلوقتي، مثال:\n"
-            "`https://viamaker.ar.uptodown.com/android`\n\n"
+            "🔗 ابعت رابط صفحة التطبيق على Google Play دلوقتي، مثال:\n"
+            "`https://play.google.com/store/apps/details?id=com.zhiliaoapp.musically&hl=ar`\n\n"
             "هحاول أطلع منها كل حاجة أقدر عليها (الاسم، المطور، الأيقونة، الوصف، "
-            "التقييم، الحجم...إلخ)، وأي حاجة مش لاقيها هسألك عليها عادي — "
-            "ورابط التنزيل المباشر هتكتبه انت دايمًا."
+            "التقييم، الحجم، لقطات الشاشة بأعلى جودة...إلخ)، وأي حاجة مش لاقيها "
+            "هسألك عليها عادي — ورابط التنزيل المباشر هتكتبه انت دايمًا."
         )
     elif data == "pubauto_no":
         await start_publish_flow(query, context, st)
@@ -3905,4 +4037,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
