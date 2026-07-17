@@ -33,6 +33,7 @@ import logging
 import subprocess
 import requests
 import datetime
+import urllib.parse
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -1206,6 +1207,105 @@ def _to_firestore_value(v):
     return {"stringValue": str(v)}
 
 
+def _from_firestore_value(v):
+    """يحوّل قيمة Firestore (REST API) لقيمة بايثون عادية."""
+    if not isinstance(v, dict):
+        return None
+    if "nullValue" in v:
+        return None
+    if "booleanValue" in v:
+        return bool(v["booleanValue"])
+    if "integerValue" in v:
+        try:
+            return int(v["integerValue"])
+        except Exception:
+            return 0
+    if "doubleValue" in v:
+        return v["doubleValue"]
+    if "stringValue" in v:
+        return v["stringValue"]
+    if "timestampValue" in v:
+        return v["timestampValue"]
+    if "mapValue" in v:
+        fields = v["mapValue"].get("fields", {}) or {}
+        return {k: _from_firestore_value(v2) for k, v2 in fields.items()}
+    if "arrayValue" in v:
+        values = v["arrayValue"].get("values", []) or []
+        return [_from_firestore_value(x) for x in values]
+    return None
+
+
+def firestore_query_app_by_field_sync(field_name: str, field_value: str) -> dict | None:
+    """يدور على أول مستند في مجموعة apps بحيث field_name == field_value، ويرجع
+    بياناته كـ dict بايثون عادي (أو None لو مفيش نتيجة/حصل خطأ)."""
+    try:
+        id_token = _firebase_get_id_token_sync()
+    except Exception:
+        return None
+
+    project_id = CFG.get("firebase_project_id", "")
+    url = f"https://firestore.googleapis.com/v1/projects/{project_id}/databases/(default)/documents:runQuery"
+    body = {
+        "structuredQuery": {
+            "from": [{"collectionId": "apps"}],
+            "where": {
+                "fieldFilter": {
+                    "field": {"fieldPath": field_name},
+                    "op": "EQUAL",
+                    "value": {"stringValue": field_value},
+                }
+            },
+            "limit": 1,
+        }
+    }
+    try:
+        r = requests.post(url, headers={"Authorization": f"Bearer {id_token}"}, json=body, timeout=30)
+        if r.status_code == 401:
+            id_token = _firebase_sign_in_sync()
+            r = requests.post(url, headers={"Authorization": f"Bearer {id_token}"}, json=body, timeout=30)
+    except Exception:
+        return None
+
+    if not r.ok:
+        return None
+
+    try:
+        results = r.json()
+    except Exception:
+        return None
+
+    for item in results:
+        doc = item.get("document")
+        if doc:
+            fields = doc.get("fields", {}) or {}
+            return {k: _from_firestore_value(v) for k, v in fields.items()}
+    return None
+
+
+def find_app_by_site_link_sync(link: str) -> dict | None:
+    """يستخرج قيمة ?app= من لينك صفحة التطبيق، ويدور عليها في Firestore
+    أول بحقل seoSlug، وبعدين بمحاولة تحويلها لـ packageId (شرطات لنقط)."""
+    try:
+        parsed = urllib.parse.urlparse(link)
+        qs = urllib.parse.parse_qs(parsed.query)
+        slug = (qs.get("app", [""])[0] or "").strip()
+    except Exception:
+        slug = ""
+    if not slug:
+        return None
+
+    app_data = firestore_query_app_by_field_sync("seoSlug", slug)
+    if app_data:
+        return app_data
+
+    guessed_pkg = slug.replace("-", ".")
+    app_data = firestore_query_app_by_field_sync("packageId", guessed_pkg)
+    if app_data:
+        return app_data
+
+    return None
+
+
 def firestore_add_document_sync(collection_name: str, data: dict) -> tuple[bool, str]:
     """يضيف مستند جديد لمجموعة معيّنة في Firestore عبر REST API، ويرجع (نجاح, رسالة/آيدي)."""
     try:
@@ -1265,6 +1365,8 @@ def main_menu_kb():
         [InlineKeyboardButton("📄 استبدال ملف/ملفات بالاسم (تلقائي)", callback_data="menu_search_filename")],
         [InlineKeyboardButton("📍 استبدال ملف بمسار محدد (يدوي)", callback_data="menu_path_replace")],
         [InlineKeyboardButton("📤 نشر تطبيق على الموقع", callback_data="menu_publish_app")],
+        [InlineKeyboardButton("📢 نشر تطبيق في قناة تيليجرام (بلينك)", callback_data="menu_channel_publish_link")],
+        [InlineKeyboardButton("🆔 تحديث آيدي/يوزر القناة", callback_data="menu_update_channel_id")],
         [InlineKeyboardButton("📦 نقل classes.zip", callback_data="menu_classes")],
         [InlineKeyboardButton("🔑 إدارة شهادات التوقيع", callback_data="menu_keystores")],
         [InlineKeyboardButton("🐙 تحديث توكن GitHub", callback_data="menu_update_github_token")],
@@ -1607,6 +1709,73 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "هيتضاف تلقائيًا كحقل \"ownerUid\" في أي تطبيق تنشره من دلوقتي.",
             reply_markup=main_menu_kb(),
         )
+        return
+
+    if awaiting == "new_channel_id":
+        new_channel = text.strip()
+        st.pop("await", None)
+
+        if not new_channel or " " in new_channel:
+            await update.message.reply_text(
+                "❌ ده مش شكل صحيح. ابعت يوزر القناة (مثال: `@my_channel`) أو آيديها الرقمي "
+                "(مثال: `-1001234567890`) من غير مسافات.",
+                reply_markup=main_menu_kb(),
+                parse_mode="Markdown",
+            )
+            return
+
+        if not (new_channel.startswith("@") or new_channel.lstrip("-").isdigit()):
+            await update.message.reply_text(
+                "❌ لازم يبدأ بـ @ (لو يوزر) أو يكون رقم آيدي (ممكن يبدأ بـ -). حاول تاني:",
+            )
+            return
+
+        try:
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+            else:
+                existing = dict(DEFAULT_CONFIG)
+        except Exception:
+            existing = dict(DEFAULT_CONFIG)
+        existing["telegram_channel_id"] = new_channel
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+        CFG["telegram_channel_id"] = new_channel
+
+        await update.message.reply_text(
+            f"✅ تم حفظ آيدي/يوزر القناة بنجاح:\n`{new_channel}`\n\n"
+            "تأكد إن البوت أدمن في القناة دي ومعاه صلاحية \"نشر رسائل\".",
+            reply_markup=main_menu_kb(),
+            parse_mode="Markdown",
+        )
+        return
+
+    if awaiting == "channel_publish_link":
+        link = text.strip()
+        st.pop("await", None)
+
+        if not link.lower().startswith(("http://", "https://")):
+            await update.message.reply_text(
+                "❌ ابعت لينك صحيح لصفحة التطبيق على الموقع (يبدأ بـ http/https):",
+                reply_markup=main_menu_kb(),
+            )
+            return
+
+        status_msg = await update.message.reply_text("⏳ جاري البحث عن بيانات التطبيق...")
+        app_data = await asyncio.to_thread(find_app_by_site_link_sync, link)
+
+        if not app_data:
+            await status_msg.edit_text(
+                "❌ مقدرتش ألاقي تطبيق منشور على الموقع بهذا اللينك. "
+                "تأكد إن اللينك فيه \"?app=...\" وإن التطبيق ده منشور فعلًا.",
+            )
+            await context.bot.send_message(update.effective_chat.id, "📋 القائمة الرئيسية:", reply_markup=main_menu_kb())
+            return
+
+        await status_msg.edit_text("⏳ جاري النشر في القناة...")
+        ok, msg = await post_app_to_channel(context.bot, app_data, site_url=link)
+        await context.bot.send_message(update.effective_chat.id, msg, reply_markup=main_menu_kb())
         return
 
     if awaiting == "new_firebase_email":
@@ -3403,12 +3572,12 @@ def build_channel_message(app_data: dict, site_url: str) -> str:
     return "\n".join(lines)
 
 
-async def post_app_to_channel(bot, app_data: dict) -> tuple[bool, str]:
+async def post_app_to_channel(bot, app_data: dict, site_url: str = "") -> tuple[bool, str]:
     channel_id = (CFG.get("telegram_channel_id") or "").strip()
     if not channel_id:
-        return False, "❌ آيدي قناة التيليجرام مش متظبط في الإعدادات (telegram_channel_id)."
+        return False, "❌ آيدي قناة التيليجرام مش متظبط في الإعدادات (telegram_channel_id). حدّثها من زرار \"🆔 تحديث آيدي/يوزر القناة\" في القائمة الرئيسية."
 
-    site_url = build_site_app_url(app_data)
+    site_url = (site_url or "").strip() or build_site_app_url(app_data)
     if not site_url:
         return False, "❌ مقدرتش أبني رابط صفحة التطبيق على الموقع (تأكد من site_app_page_url و Package ID)."
 
@@ -3947,6 +4116,26 @@ async def _handle_callback(query, context, uid, data, st):
             "ابعت التوكن الجديد (Personal Access Token) دلوقتي كرسالة واحدة.\n"
             "⚠️ همسح رسالتك اللي فيها التوكن فورًا من الشات بعد الحفظ، "
             "عشان ميفضلش ظاهر في تاريخ المحادثة."
+        )
+
+    # ── نشر تطبيق في قناة تيليجرام مباشرة عن طريق لينك صفحته على الموقع ──
+    elif data == "menu_channel_publish_link":
+        st["await"] = "channel_publish_link"
+        await query.edit_message_text(
+            "📢 نشر تطبيق في قناة تيليجرام\n\n"
+            "ابعت لينك صفحة التطبيق على الموقع (اللي فيه \"?app=...\")، "
+            "وهجيب بياناته (الاسم، الوصف، الصورة، الحجم...) من الموقع وأنشرها في القناة تلقائيًا."
+        )
+
+    # ── تحديث آيدي/يوزر قناة تيليجرام ──
+    elif data == "menu_update_channel_id":
+        st["await"] = "new_channel_id"
+        current_channel = CFG.get("telegram_channel_id", "").strip() or "غير محدد"
+        await query.edit_message_text(
+            "🆔 تحديث آيدي/يوزر قناة تيليجرام\n\n"
+            f"القيمة الحالية: `{current_channel}`\n\n"
+            "ابعت يوزر القناة (مثال: `@my_channel`) أو آيديها الرقمي (مثال: `-1001234567890`).\n"
+            "لازم البوت يكون أدمن في القناة دي بصلاحية \"نشر رسائل\"."
         )
 
     # ── تحديث User UID (Firebase) ──
