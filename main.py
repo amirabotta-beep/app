@@ -1235,13 +1235,13 @@ def _from_firestore_value(v):
     return None
 
 
-def firestore_query_app_by_field_sync(field_name: str, field_value: str) -> dict | None:
+def firestore_query_app_by_field_sync(field_name: str, field_value: str) -> tuple[dict | None, str]:
     """يدور على أول مستند في مجموعة apps بحيث field_name == field_value، ويرجع
-    بياناته كـ dict بايثون عادي (أو None لو مفيش نتيجة/حصل خطأ)."""
+    (بيانات التطبيق أو None، رسالة تشخيص لو حصل خطأ)."""
     try:
         id_token = _firebase_get_id_token_sync()
-    except Exception:
-        return None
+    except Exception as e:
+        return None, f"فشل تسجيل الدخول لـ Firebase: {e}"
 
     project_id = CFG.get("firebase_project_id", "")
     url = f"https://firestore.googleapis.com/v1/projects/{project_id}/databases/(default)/documents:runQuery"
@@ -1263,28 +1263,37 @@ def firestore_query_app_by_field_sync(field_name: str, field_value: str) -> dict
         if r.status_code == 401:
             id_token = _firebase_sign_in_sync()
             r = requests.post(url, headers={"Authorization": f"Bearer {id_token}"}, json=body, timeout=30)
-    except Exception:
-        return None
+    except Exception as e:
+        return None, f"خطأ في الاتصال بـ Firestore: {e}"
 
     if not r.ok:
-        return None
+        try:
+            err = r.json()
+            if isinstance(err, list) and err:
+                err = err[0].get("error", err[0])
+            if isinstance(err, dict):
+                err = err.get("error", {}).get("message", err)
+        except Exception:
+            err = r.text
+        return None, f"فشل الاستعلام ({field_name}={field_value}) — {r.status_code}: {err}"
 
     try:
         results = r.json()
-    except Exception:
-        return None
+    except Exception as e:
+        return None, f"رد غير مفهوم من Firestore: {e}"
 
     for item in results:
         doc = item.get("document")
         if doc:
             fields = doc.get("fields", {}) or {}
-            return {k: _from_firestore_value(v) for k, v in fields.items()}
-    return None
+            return {k: _from_firestore_value(v) for k, v in fields.items()}, ""
+    return None, ""
 
 
-def find_app_by_site_link_sync(link: str) -> dict | None:
+def find_app_by_site_link_sync(link: str) -> tuple[dict | None, str]:
     """يستخرج قيمة ?app= من لينك صفحة التطبيق، ويدور عليها في Firestore
-    أول بحقل seoSlug، وبعدين بمحاولة تحويلها لـ packageId (شرطات لنقط)."""
+    أول بحقل seoSlug، وبعدين بمحاولة تحويلها لـ packageId (شرطات لنقط).
+    يرجع (بيانات التطبيق أو None، تفاصيل تشخيص للعرض عند الفشل)."""
     try:
         parsed = urllib.parse.urlparse(link)
         qs = urllib.parse.parse_qs(parsed.query)
@@ -1292,18 +1301,24 @@ def find_app_by_site_link_sync(link: str) -> dict | None:
     except Exception:
         slug = ""
     if not slug:
-        return None
+        return None, "اللينك ده مفيهوش \"?app=...\" — تأكد إنه لينك صفحة تطبيق صحيح."
 
-    app_data = firestore_query_app_by_field_sync("seoSlug", slug)
+    debug_lines = [f"🔎 الـ slug المستخرج من اللينك: `{slug}`"]
+
+    app_data, err = firestore_query_app_by_field_sync("seoSlug", slug)
+    debug_lines.append(f"— بحث بحقل seoSlug == {slug}: " + (err if err else ("لقيت تطبيق ✅" if app_data else "مفيش نتيجة")))
     if app_data:
-        return app_data
+        return app_data, ""
+    if err:
+        return None, "\n".join(debug_lines)
 
     guessed_pkg = slug.replace("-", ".")
-    app_data = firestore_query_app_by_field_sync("packageId", guessed_pkg)
+    app_data, err = firestore_query_app_by_field_sync("packageId", guessed_pkg)
+    debug_lines.append(f"— بحث بحقل packageId == {guessed_pkg}: " + (err if err else ("لقيت تطبيق ✅" if app_data else "مفيش نتيجة")))
     if app_data:
-        return app_data
+        return app_data, ""
 
-    return None
+    return None, "\n".join(debug_lines)
 
 
 def firestore_add_document_sync(collection_name: str, data: dict) -> tuple[bool, str]:
@@ -1763,12 +1778,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         status_msg = await update.message.reply_text("⏳ جاري البحث عن بيانات التطبيق...")
-        app_data = await asyncio.to_thread(find_app_by_site_link_sync, link)
+        app_data, debug_info = await asyncio.to_thread(find_app_by_site_link_sync, link)
 
         if not app_data:
             await status_msg.edit_text(
-                "❌ مقدرتش ألاقي تطبيق منشور على الموقع بهذا اللينك. "
-                "تأكد إن اللينك فيه \"?app=...\" وإن التطبيق ده منشور فعلًا.",
+                "❌ مقدرتش ألاقي تطبيق منشور على الموقع بهذا اللينك.\n\n"
+                + (debug_info or "تأكد إن اللينك فيه \"?app=...\" وإن التطبيق ده منشور فعلًا."),
             )
             await context.bot.send_message(update.effective_chat.id, "📋 القائمة الرئيسية:", reply_markup=main_menu_kb())
             return
