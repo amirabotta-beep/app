@@ -62,6 +62,7 @@ TOOLS_DIR       = os.path.join(BASE_DIR, "tools")
 WORKSPACE_DIR   = os.path.join(BASE_DIR, "workspace")
 KEYSTORES_DIR   = os.path.join(WORKSPACE_DIR, "keystores")
 PROJECT_DIR     = os.path.join(WORKSPACE_DIR, "current_project")
+PUBLISH_DRAFTS_DIR = os.path.join(WORKSPACE_DIR, "publish_drafts")
 APK_COPY_PATH   = os.path.join(WORKSPACE_DIR, "current.apk")
 CONFIG_PATH     = os.path.join(BASE_DIR, "config.json")
 
@@ -123,7 +124,7 @@ SMALI_MEM_OPTS = [
 # نثبته عند 2 عشان يتماشى مع الـ 2 vCPU المتاحة من غير تزاحم زيادة.
 SMALI_JOBS = str(max(1, min(os.cpu_count() or 2, 2)))
 
-for _d in (TOOLS_DIR, WORKSPACE_DIR, KEYSTORES_DIR):
+for _d in (TOOLS_DIR, WORKSPACE_DIR, KEYSTORES_DIR, PUBLISH_DRAFTS_DIR):
     os.makedirs(_d, exist_ok=True)
 
 # =============================================================================
@@ -3191,12 +3192,55 @@ def scrape_app_info_sync(url: str) -> dict:
     return out
 
 
+def _publish_draft_path(chat_id) -> str:
+    return os.path.join(PUBLISH_DRAFTS_DIR, f"{chat_id}.json")
+
+
+def save_publish_draft(chat_id, data: dict) -> None:
+    """بتحفظ تفاصيل التطبيق الكاملة (الوصف الطويل، لقطات الشاشة...) في ملف
+    JSON على السيرفر، بدل ما تتحط خام جوه رسالة تيليجرام. ده اللي بيمنع
+    أي احتمال لتجاوز حد طول الرسالة (Message_too_long) مهما كانت البيانات
+    كبيرة، لأن الرسالة بقت بتعرض ملخص قصير بس مش القيم الخام."""
+    try:
+        with open(_publish_draft_path(chat_id), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        log.warning(f"⚠️ فشل حفظ مسودة النشر في ملف (chat_id={chat_id})", exc_info=True)
+
+
+def delete_publish_draft(chat_id) -> None:
+    """بتمسح ملف المسودة بعد النشر بنجاح أو الإلغاء، عشان تنضّف كل حاجة."""
+    try:
+        os.remove(_publish_draft_path(chat_id))
+    except Exception:
+        pass
+
+
+def _build_short_autofill_summary(data: dict) -> str:
+    """بترجع ملخص قصير جدًا (سطر لكل حقل، مقتطف مش القيمة الخام) للحقول
+    اللي اتلقطت أوتوماتيك. البيانات الكاملة (الوصف الطويل، لقطات الشاشة)
+    بتتحفظ في ملف على السيرفر مش في الرسالة، فمستحيل الرسالة دي تتجاوز حد
+    تليجرام مهما كانت البيانات كبيرة."""
+    known = {s["key"]: s for s in PUBLISH_FIELDS}
+    lines = []
+    for k, v in data.items():
+        if v in (None, "", []) or (isinstance(v, str) and not v.strip()):
+            continue
+        step = known.get(k, {"type": "text"})
+        preview = _publish_field_preview(step, v)
+        label = known.get(k, {}).get("short", k)
+        lines.append(f"• {label}: {preview}")
+    return "\n".join(lines) if lines else "—"
+
+
 async def start_publish_flow(query, context, st, prefill=None):
     st["publish_data"] = dict(prefill or {})
     st.pop("publish_step", None)
     st.pop("publish_list_temp", None)
     st.pop("publish_edit_idx", None)
     st.pop("await", None)
+    chat_id = query.message.chat_id
+    save_publish_draft(chat_id, st["publish_data"])
     intro = (
         "📤 نشر تطبيق جديد على الموقع\n\n"
         "هتلاقي تحت كل الحقول مرة واحدة كأزرار. دوس على أي حقل عشان تملاه "
@@ -3204,15 +3248,15 @@ async def start_publish_flow(query, context, st, prefill=None):
         "الحقول اللي عليها ❗ لازم تتملى قبل النشر."
     )
     if prefill:
-        filled_lines = "\n".join(f"• {k}: {v}" for k, v in prefill.items() if str(v).strip())
         intro = (
-            "✅ الحقول اللي اتلقطت أوتوماتيك من الرابط:\n"
-            f"{filled_lines}\n\n"
+            "✅ الحقول اللي اتلقطت أوتوماتيك من الرابط (التفاصيل الكاملة "
+            "محفوظة في ملف على السيرفر):\n"
+            f"{_build_short_autofill_summary(prefill)}\n\n"
             "دوس على أي حقل تحت عشان تعدله أو تملي الباقي، ولما تخلص دوس "
             "\"📤 نشر الآن\"."
         )
     await query.edit_message_text(intro)
-    await send_publish_review(context.bot, query.message.chat_id, st)
+    await send_publish_review(context.bot, chat_id, st)
 
 
 async def start_publish_autofill(context, chat_id, st, url):
@@ -3234,12 +3278,13 @@ async def start_publish_autofill(context, chat_id, st, url):
     st.pop("publish_step", None)
     st.pop("publish_list_temp", None)
     st.pop("publish_edit_idx", None)
+    save_publish_draft(chat_id, st["publish_data"])
 
     if st["publish_data"]:
-        filled_lines = "\n".join(f"• {k}: {v}" for k, v in st["publish_data"].items() if str(v).strip())
         await status_msg.edit_text(
-            "✅ اللي اتلقط أوتوماتيك من الرابط:\n"
-            f"{filled_lines}\n\n"
+            "✅ اللي اتلقط أوتوماتيك من الرابط (التفاصيل الكاملة محفوظة في "
+            "ملف على السيرفر):\n"
+            f"{_build_short_autofill_summary(st['publish_data'])}\n\n"
             "دوس على أي حقل تحت عشان تعدله أو تملي الباقي (رابط التنزيل "
             "المباشر لازم تكتبه انت)."
         )
@@ -3289,6 +3334,7 @@ async def send_publish_review(bot, chat_id, st):
     st.pop("await", None)
     st.pop("publish_edit_idx", None)
     st.pop("publish_list_temp", None)
+    save_publish_draft(chat_id, data)
     await bot.send_message(
         chat_id,
         "📋 بيانات التطبيق دلوقتي — دوس على أي حقل تعدله، وبعدين \"📤 نشر الآن\":",
@@ -3301,6 +3347,7 @@ async def edit_publish_review(query, st):
     st.pop("await", None)
     st.pop("publish_edit_idx", None)
     st.pop("publish_list_temp", None)
+    save_publish_draft(query.message.chat_id, data)
     await query.edit_message_text(
         "📋 بيانات التطبيق دلوقتي — دوس على أي حقل تعدله، وبعدين \"📤 نشر الآن\":",
         reply_markup=build_publish_review_kb(data),
@@ -3509,6 +3556,7 @@ async def finalize_publish(bot, chat_id, st):
     st.pop("publish_data", None)
     st.pop("publish_step", None)
     st.pop("publish_list_temp", None)
+    delete_publish_draft(chat_id)
 
     if ok:
         await bot.send_message(
@@ -4162,6 +4210,7 @@ async def _handle_callback(query, context, uid, data, st):
         st.pop("publish_list_temp", None)
         st.pop("publish_edit_idx", None)
         st.pop("await", None)
+        delete_publish_draft(query.message.chat_id)
         await query.edit_message_text("❌ اتلغى النشر.")
         await context.bot.send_message(query.message.chat_id, "📋 القائمة الرئيسية:", reply_markup=main_menu_kb())
     elif data.startswith("pubf:"):
