@@ -35,7 +35,7 @@ import requests
 import datetime
 import urllib.parse
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -740,7 +740,7 @@ async def check_java_flow(query):
             "✅ الجافا موجودة وشغالة بالفعل!\n\n"
             f"📍 المسار: {JAVA_BIN}\n"
             f"ℹ️ {version_line}",
-            reply_markup=main_menu_kb(),
+            reply_markup=None,
         )
         return
 
@@ -787,14 +787,14 @@ async def check_java_flow(query):
             f"⏱ المدة الكلية: {elapsed:.1f} ثانية\n"
             f"📍 المسار: {JAVA_BIN}\n\n"
             f"📋 سجل التيمر:\n{tail_log(log_text, 700)}",
-            reply_markup=main_menu_kb(),
+            reply_markup=None,
         )
     else:
         await msg.edit_text(
             "❌ فشل تحميل/تجهيز الجافا.\n\n"
             f"⏱ المدة قبل الفشل: {elapsed:.1f} ثانية\n\n"
             f"📋 سجل التيمر (ابعتهولي وأنا أعرف المشكلة فين):\n{tail_log(log_text, 900)}",
-            reply_markup=main_menu_kb(),
+            reply_markup=None,
         )
 
 
@@ -933,7 +933,7 @@ async def check_tools_flow(query):
     if ok1 and ok2 and ok3 and ok4:
         await msg.edit_text(
             "✅ كل الأدوات موجودة وسليمة!\n\n" + f"{msg1}\n{msg2}\n{msg3}\n{msg4}",
-            reply_markup=main_menu_kb(),
+            reply_markup=None,
         )
         return
 
@@ -1002,7 +1002,7 @@ async def check_tools_flow(query):
         f"⏱ المدة الكلية: {total_elapsed:.1f} ثانية\n\n"
         f"{msg1f}\n{msg2f}\n{msg3f}\n{msg4f}\n\n"
         f"📋 سجل التيمر (ابعتهولي لو فيه مشكلة):\n{tail_log(chr(10).join(full_log), 900)}",
-        reply_markup=main_menu_kb(),
+        reply_markup=None,
     )
 
 
@@ -1373,30 +1373,116 @@ def firestore_add_document_sync(collection_name: str, data: dict) -> tuple[bool,
 # =============================================================================
 # القائمة الرئيسية
 # =============================================================================
+# =============================================================================
+# القائمة الرئيسية — كيبورد ثابت في الشريط تحت (نفس مكان الكتابة/إرسال الصور)
+# بدل الأزرار المدمجة جوه الرسالة (Inline) اللي كانت بتتحدث/تختفي.
+# كل صف مجمّع فيه العناصر المرتبطة ببعض (فحص/تحميل مع بعض، بيانات مع بعض...).
+# =============================================================================
+MAIN_MENU_LAYOUT = [
+    # المشروع: تنزيل وتجميع
+    ["📥 تنزيل APK من رابط", "🖊 تجميع وتوقيع"],
+    # البحث والاستبدال
+    ["🔍 بحث واستبدال smali"],
+    ["📄 استبدال بالاسم (تلقائي)", "📍 استبدال بمسار (يدوي)"],
+    # النشر
+    ["📤 نشر على الموقع", "📢 نشر في القناة"],
+    # الفحص والتحميل (أدوات التشغيل) — مجمّعين مع بعض زي ما طلبت
+    ["☕ فحص/تحميل Java", "🛠 فحص/تحميل الأدوات"],
+    # البيانات والإعدادات — مجمّعين مع بعض
+    ["🆔 آيدي القناة", "🐙 توكن GitHub"],
+    ["🆔 User UID", "📧 بيانات Firebase"],
+    # الإدارة
+    ["📦 نقل classes.zip", "🔑 شهادات التوقيع"],
+    # منطقة الخطر
+    ["🗑 حذف المشروع الحالي"],
+    ["♻️ إعادة ستارت", "🔄 ريستارت كامل"],
+]
+
+# تحويل نص الزرار (زي ما هيوصل من المستخدم لما يدوس عليه) لنفس الـ callback_data
+# القديمة، عشان نعيد استخدام نفس منطق المعالجة الموجود في _handle_callback.
+MAIN_MENU_TEXT_TO_ACTION = {
+    "📥 تنزيل APK من رابط": "menu_download_url",
+    "🖊 تجميع وتوقيع": "menu_build",
+    "🔍 بحث واستبدال smali": "menu_search",
+    "📄 استبدال بالاسم (تلقائي)": "menu_search_filename",
+    "📍 استبدال بمسار (يدوي)": "menu_path_replace",
+    "📤 نشر على الموقع": "menu_publish_app",
+    "📢 نشر في القناة": "menu_channel_publish_link",
+    "☕ فحص/تحميل Java": "menu_check_java",
+    "🛠 فحص/تحميل الأدوات": "menu_check_tools",
+    "🆔 آيدي القناة": "menu_update_channel_id",
+    "🐙 توكن GitHub": "menu_update_github_token",
+    "🆔 User UID": "menu_update_owner_uid",
+    "📧 بيانات Firebase": "menu_update_firebase_login",
+    "📦 نقل classes.zip": "menu_classes",
+    "🔑 شهادات التوقيع": "menu_keystores",
+    "🗑 حذف المشروع الحالي": "menu_delete_project",
+    "♻️ إعادة ستارت": "menu_soft_restart",
+    "🔄 ريستارت كامل": "menu_full_restart",
+}
+
+
 def main_menu_kb():
-    rows = [
-        [InlineKeyboardButton("📥 تنزيل APK من رابط", callback_data="menu_download_url")],
-        [InlineKeyboardButton("🖊 تجميع وتوقيع", callback_data="menu_build")],
-        [InlineKeyboardButton("🔍 بحث واستبدال smali", callback_data="menu_search")],
-        [InlineKeyboardButton("📄 استبدال ملف/ملفات بالاسم (تلقائي)", callback_data="menu_search_filename")],
-        [InlineKeyboardButton("📍 استبدال ملف بمسار محدد (يدوي)", callback_data="menu_path_replace")],
-        [InlineKeyboardButton("📤 نشر تطبيق على الموقع", callback_data="menu_publish_app")],
-        [InlineKeyboardButton("📢 نشر تطبيق في قناة تيليجرام (بلينك)", callback_data="menu_channel_publish_link")],
-        [InlineKeyboardButton("🆔 تحديث آيدي/يوزر القناة", callback_data="menu_update_channel_id")],
-        [InlineKeyboardButton("📦 نقل classes.zip", callback_data="menu_classes")],
-        [InlineKeyboardButton("🔑 إدارة شهادات التوقيع", callback_data="menu_keystores")],
-        [InlineKeyboardButton("🐙 تحديث توكن GitHub", callback_data="menu_update_github_token")],
-        [InlineKeyboardButton("🆔 تحديث User UID", callback_data="menu_update_owner_uid")],
-        [InlineKeyboardButton("📧 تحديث بيانات دخول Firebase", callback_data="menu_update_firebase_login")],
-        [InlineKeyboardButton("☕ فحص/تحميل Java", callback_data="menu_check_java")],
-        [InlineKeyboardButton("🛠 فحص/تحميل أدوات APK", callback_data="menu_check_tools")],
-        [InlineKeyboardButton("🗑 حذف المشروع الحالي", callback_data="menu_delete_project")],
-        [
-            InlineKeyboardButton("♻️ إعادة ستارت", callback_data="menu_soft_restart"),
-            InlineKeyboardButton("🔄 ريستارت كامل", callback_data="menu_full_restart"),
-        ],
-    ]
-    return InlineKeyboardMarkup(rows)
+    """كيبورد ثابت (Reply Keyboard) في شريط الكتابة تحت، مش أزرار مدمجة جوه الرسالة.
+    بيفضل ظاهر طول الوقت جنب مكان كتابة النص وإرسال الصور/الملفات."""
+    return ReplyKeyboardMarkup(
+        MAIN_MENU_LAYOUT,
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+class _TextAsQueryAdapter:
+    """محاكاة كائن CallbackQuery عشان نقدر نستخدم نفس دوال معالجة القائمة
+    (اللي أصلاً مكتوبة عشان تستقبل query من ضغطة زرار Inline) مع رسالة نصية
+    عادية جاية من الكيبورد الثابت تحت. edit_message_text بيتحول هنا لرسالة
+    جديدة عادية (message.reply_text) لأنه مفيش رسالة قديمة نقدر نعدلها."""
+
+    def __init__(self, message, data):
+        self.message   = message
+        self.from_user = message.from_user
+        self.data      = data
+
+    async def edit_message_text(self, text, reply_markup=None, **kwargs):
+        # لو الـ reply_markup اللي جاي InlineKeyboardMarkup سيبه زي ما هو (لسه
+        # مفيد كأزرار مؤقتة جوه الخطوة)، أما لو مفيش أو كان كيبورد القائمة
+        # الرئيسية فمش محتاجين نبعته تاني لأنه أصلاً ثابت تحت.
+        if isinstance(reply_markup, ReplyKeyboardMarkup):
+            reply_markup = None
+        return await self.message.reply_text(text, reply_markup=reply_markup, **kwargs)
+
+    async def answer(self, *args, **kwargs):
+        pass
+
+
+async def dispatch_main_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE, uid: int, action: str):
+    """نفس منطق on_callback لكن مصدره ضغطة على زرار من الكيبورد الثابت تحت
+    بدل زرار Inline. بيعيد استخدام _handle_callback نفسها."""
+    st = get_state(uid)
+
+    HEAVY_ACTIONS = {
+        "dl_decompile", "sign_random", "menu_build",
+        "confirm_delete", "confirm_replace", "confirm_insert",
+    }
+    if action in HEAVY_ACTIONS and st.get("busy"):
+        await update.message.reply_text("⏳ في عملية شغالة بالفعل، استنى تخلص الأول.")
+        return
+
+    # زرار من القائمة الرئيسية يعتبر بداية جديدة — نمسح أي حالة انتظار قديمة
+    # عالقة (زي لو كان مستنّي منك رد على خطوة سابقة) قبل ما ننفذ الأمر الجديد.
+    reset_state(uid)
+    st = get_state(uid)
+
+    is_heavy = action in HEAVY_ACTIONS
+    if is_heavy:
+        st["busy"] = True
+
+    query = _TextAsQueryAdapter(update.message, action)
+    try:
+        await _handle_callback(query, context, uid, action, st)
+    finally:
+        if is_heavy:
+            st["busy"] = False
 
 
 def project_status_text():
@@ -1630,7 +1716,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(f"✅ تم فك الـ APK بنجاح في {format_duration(elapsed)}.\n" + tail_log(log_text))
             await update.message.reply_text("📋 القائمة الرئيسية:", reply_markup=main_menu_kb())
         else:
-            await msg.edit_text("❌ فشلت عملية الفك:\n" + tail_log(log_text, 1500), reply_markup=main_menu_kb())
+            await msg.edit_text("❌ فشلت عملية الفك:\n" + tail_log(log_text, 1500), reply_markup=None)
         return
 
     await update.message.reply_text(
@@ -1650,6 +1736,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st       = get_state(uid)
     awaiting = st.get("await")
     text     = update.message.text.strip()
+
+    # ── ضغطة على زرار من الكيبورد الثابت تحت (القائمة الرئيسية) ──
+    # بتشتغل فورًا بغض النظر عن أي حالة انتظار سابقة (زي الرجوع للقائمة).
+    if text in MAIN_MENU_TEXT_TO_ACTION:
+        await dispatch_main_menu_text(update, context, uid, MAIN_MENU_TEXT_TO_ACTION[text])
+        return
 
     if awaiting == "path_replace_query":
         await handle_path_replace_query(update, st, text)
@@ -1685,7 +1777,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text(
                 "❌ التوكن مرفوض من GitHub (401 Bad credentials).\n"
                 "اتأكد إنك نسخته كامل من غير مسافات، وإنه لسه صالح ومش ملغي، وحاول تاني.",
-                reply_markup=main_menu_kb(),
+                reply_markup=None,
             )
             return
 
@@ -1719,7 +1811,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await status_msg.edit_text(
             "✅ تم حفظ توكن GitHub الجديد والتحقق منه بنجاح." + extra_note,
-            reply_markup=main_menu_kb(),
+            reply_markup=None,
         )
         return
 
@@ -1882,7 +1974,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"❌ تسجيل الدخول فشل ({err}).\n"
                 "اتأكد إن الإيميل والباسورد صح، وإن الحساب ده متسجّل فعلاً في "
                 "Firebase Authentication، وحاول تاني من القائمة.",
-                reply_markup=main_menu_kb(),
+                reply_markup=None,
             )
             return
 
@@ -1910,7 +2002,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await status_msg.edit_text(
             "✅ تم حفظ بيانات دخول Firebase الجديدة والتحقق منها بنجاح.",
-            reply_markup=main_menu_kb(),
+            reply_markup=None,
         )
         return
 
@@ -2050,7 +2142,7 @@ async def do_build_and_sign(context, chat_id, status_msg, uid, mode, ks_name=Non
         return
     problems = check_project_integrity(PROJECT_DIR)
     if problems:
-        await status_msg.edit_text(project_integrity_report_text(problems), reply_markup=main_menu_kb())
+        await status_msg.edit_text(project_integrity_report_text(problems), reply_markup=None)
         return
     ok_jar, jar_msg = verify_jar_file(SMALI_JAR)
     if not ok_jar:
@@ -2077,7 +2169,7 @@ async def do_build_and_sign(context, chat_id, status_msg, uid, mode, ks_name=Non
     if ok:
         record_stage_time("build", project_size, build_elapsed)
     if not ok or not os.path.isfile(unsigned_apk):
-        await status_msg.edit_text("❌ فشل التجميع:\n" + tail_log(log_text), reply_markup=main_menu_kb())
+        await status_msg.edit_text("❌ فشل التجميع:\n" + tail_log(log_text), reply_markup=None)
         return
 
     build_done_text = f"✅ 1) تم التجميع في {format_duration(build_elapsed)}."
@@ -2091,7 +2183,7 @@ async def do_build_and_sign(context, chat_id, status_msg, uid, mode, ks_name=Non
         ks = find_keystore(ks_name)
         if not ks:
             shutil.rmtree(tmp_out_dir, ignore_errors=True)
-            await status_msg.edit_text("❌ التوقيع المحدد غير موجود.", reply_markup=main_menu_kb())
+            await status_msg.edit_text("❌ التوقيع المحدد غير موجود.", reply_markup=None)
             return
         cmd += [
             "--ks", ks["path"],
@@ -2113,13 +2205,13 @@ async def do_build_and_sign(context, chat_id, status_msg, uid, mode, ks_name=Non
 
     if not ok:
         shutil.rmtree(tmp_out_dir, ignore_errors=True)
-        await status_msg.edit_text("❌ فشل التوقيع:\n" + tail_log(sign_log), reply_markup=main_menu_kb())
+        await status_msg.edit_text("❌ فشل التوقيع:\n" + tail_log(sign_log), reply_markup=None)
         return
 
     apks_found = [f for f in os.listdir(tmp_out_dir) if f.lower().endswith(".apk")]
     if not apks_found:
         shutil.rmtree(tmp_out_dir, ignore_errors=True)
-        await status_msg.edit_text("❌ لم يتم إنتاج ملف APK موقّع.", reply_markup=main_menu_kb())
+        await status_msg.edit_text("❌ لم يتم إنتاج ملف APK موقّع.", reply_markup=None)
         return
 
     signed_name = max(apks_found, key=lambda f: os.path.getmtime(os.path.join(tmp_out_dir, f)))
@@ -2312,15 +2404,15 @@ def project_integrity_report_text(problems):
 
 async def start_build_flow(query, uid):
     if not os.path.isdir(PROJECT_DIR):
-        await query.edit_message_text("❌ لا يوجد مشروع مفكوك حالياً. ابعت ملف APK أولاً.", reply_markup=main_menu_kb())
+        await query.edit_message_text("❌ لا يوجد مشروع مفكوك حالياً. ابعت ملف APK أولاً.", reply_markup=None)
         return
     problems = check_project_integrity(PROJECT_DIR)
     if problems:
-        await query.edit_message_text(project_integrity_report_text(problems), reply_markup=main_menu_kb())
+        await query.edit_message_text(project_integrity_report_text(problems), reply_markup=None)
         return
     ok_jar, jar_msg = verify_jar_file(UBER_SIGNER_JAR)
     if not ok_jar:
-        await query.edit_message_text(jar_msg, reply_markup=main_menu_kb())
+        await query.edit_message_text(jar_msg, reply_markup=None)
         return
     kb = [
         [InlineKeyboardButton("🎲 توقيع عشوائي", callback_data="sign_random")],
@@ -2492,7 +2584,7 @@ def do_insert_after_sync(project_dir, search_text, insert_text, target_rel=None)
 
 async def start_search_flow(query, st):
     if not os.path.isdir(PROJECT_DIR):
-        await query.edit_message_text("❌ لا يوجد مشروع مفكوك حالياً.", reply_markup=main_menu_kb())
+        await query.edit_message_text("❌ لا يوجد مشروع مفكوك حالياً.", reply_markup=None)
         return
     st["await"] = "search_keyword"
     await query.edit_message_text("🔍 اكتب الكلمة/النص اللي عايز تبحث بيه في ملفات smali:")
@@ -2500,11 +2592,11 @@ async def start_search_flow(query, st):
 
 async def handle_search_action(query, context, st, action):
     if not os.path.isdir(PROJECT_DIR):
-        await query.edit_message_text("❌ لا يوجد مشروع حالياً.", reply_markup=main_menu_kb())
+        await query.edit_message_text("❌ لا يوجد مشروع حالياً.", reply_markup=None)
         return
     search_text = st.get("search_text")
     if not search_text:
-        await query.edit_message_text("❌ حصل خطأ، جرب تاني من القائمة.", reply_markup=main_menu_kb())
+        await query.edit_message_text("❌ حصل خطأ، جرب تاني من القائمة.", reply_markup=None)
         return
 
     if action == "search_only":
@@ -2521,7 +2613,7 @@ async def handle_search_action(query, context, st, action):
     await query.edit_message_text("⏳ جاري تحديد الملفات المطابقة...")
     matches = await asyncio.to_thread(find_matching_smali_files, PROJECT_DIR, search_text)
     if not matches:
-        await query.edit_message_text("❌ النص غير موجود في أي ملف smali.", reply_markup=main_menu_kb())
+        await query.edit_message_text("❌ النص غير موجود في أي ملف smali.", reply_markup=None)
         return
 
     if len(matches) == 1:
@@ -2585,7 +2677,7 @@ async def proceed_search_action(query, st, action):
 # =============================================================================
 async def start_search_filename_flow(query, st):
     if not os.path.isdir(PROJECT_DIR):
-        await query.edit_message_text("❌ لا يوجد مشروع مفكوك حالياً.", reply_markup=main_menu_kb())
+        await query.edit_message_text("❌ لا يوجد مشروع مفكوك حالياً.", reply_markup=None)
         return
     st["await"] = "filename_replace_upload"
     await query.edit_message_text(
@@ -2713,7 +2805,7 @@ def build_pathpick_kb(rel_paths):
 
 async def start_path_replace_flow(query, st):
     if not os.path.isdir(PROJECT_DIR):
-        await query.edit_message_text("❌ لا يوجد مشروع مفكوك حالياً.", reply_markup=main_menu_kb())
+        await query.edit_message_text("❌ لا يوجد مشروع مفكوك حالياً.", reply_markup=None)
         return
     st["await"] = "path_replace_query"
     await query.edit_message_text(
@@ -3819,7 +3911,7 @@ async def download_apk_from_url(context, chat_id, uid, page_url: str, download_u
     ok, response, err = await asyncio.to_thread(_download)
 
     if not ok:
-        await status_msg.edit_text(err, reply_markup=main_menu_kb())
+        await status_msg.edit_text(err, reply_markup=None)
         return
 
     # استخراج اسم الملف من الرابط
@@ -3897,7 +3989,7 @@ def inject_classes_sync(project_dir, zip_path):
 
 async def start_classes_flow(query):
     if not os.path.isdir(PROJECT_DIR):
-        await query.edit_message_text("❌ لا يوجد مشروع مفكوك حالياً.", reply_markup=main_menu_kb())
+        await query.edit_message_text("❌ لا يوجد مشروع مفكوك حالياً.", reply_markup=None)
         return
     has_zip = os.path.isfile(CLASSES_ZIP_PATH)
     kb = [
@@ -3913,12 +4005,12 @@ async def do_classes_inject(query):
     if not os.path.isfile(CLASSES_ZIP_PATH):
         await query.edit_message_text(
             f"❌ ملف classes.zip غير موجود في:\n{CLASSES_ZIP_PATH}\nابعت ملف جديد أولاً عبر «استبدال ملف classes.zip».",
-            reply_markup=main_menu_kb(),
+            reply_markup=None,
         )
         return
     await query.edit_message_text("⏳ جاري الإضافة...")
     ok, msg = await asyncio.to_thread(inject_classes_sync, PROJECT_DIR, CLASSES_ZIP_PATH)
-    await query.edit_message_text(msg, reply_markup=main_menu_kb())
+    await query.edit_message_text(msg, reply_markup=None)
 
 
 # =============================================================================
@@ -3942,9 +4034,9 @@ async def delete_keystore(query, name):
             pass
         CFG["keystores"] = [x for x in CFG["keystores"] if x["name"] != name]
         save_config(CFG)
-        await query.edit_message_text(f"✅ تم حذف التوقيع \"{name}\".", reply_markup=main_menu_kb())
+        await query.edit_message_text(f"✅ تم حذف التوقيع \"{name}\".", reply_markup=None)
     else:
-        await query.edit_message_text("❌ التوقيع غير موجود.", reply_markup=main_menu_kb())
+        await query.edit_message_text("❌ التوقيع غير موجود.", reply_markup=None)
 
 
 # =============================================================================
@@ -3960,7 +4052,7 @@ async def delete_project(query):
     save_config(CFG)
     await query.edit_message_text(
         "🗑 تم مسح ملف الـ workspace بالكامل (المشروع + الـ APK + الملفات المؤقتة + التوقيعات).",
-        reply_markup=main_menu_kb(),
+        reply_markup=None,
     )
 
 
@@ -4036,7 +4128,7 @@ async def _handle_callback(query, context, uid, data, st):
     # ── رجوع ──
     if data == "back_main":
         reset_state(uid)
-        await query.edit_message_text("📋 القائمة الرئيسية:", reply_markup=main_menu_kb())
+        await query.edit_message_text("📋 القائمة الرئيسية:", reply_markup=None)
 
     # ── بناء وتوقيع ──
     elif data == "menu_build":
@@ -4070,11 +4162,11 @@ async def _handle_callback(query, context, uid, data, st):
         choice = data.split(":", 1)[1]
         if choice == "yes":
             shutil.rmtree(PROJECT_DIR, ignore_errors=True)
-            await query.edit_message_text("🧹 تم حذف مجلد المشروع.", reply_markup=main_menu_kb())
+            await query.edit_message_text("🧹 تم حذف مجلد المشروع.", reply_markup=None)
         else:
             await query.edit_message_text(
                 "📂 تمام، المشروع لسه موجود، تقدر تشتغل عليه تاني (بحث/استبدال، تجميع وتوقيع...) من القائمة.",
-                reply_markup=main_menu_kb(),
+                reply_markup=None,
             )
 
     # ── بحث واستبدال ──
@@ -4090,7 +4182,7 @@ async def _handle_callback(query, context, uid, data, st):
         else:
             idx = int(sel)
             if idx >= len(matches):
-                await query.edit_message_text("❌ حصل خطأ، جرب تاني من القائمة.", reply_markup=main_menu_kb())
+                await query.edit_message_text("❌ حصل خطأ، جرب تاني من القائمة.", reply_markup=None)
                 return
             st["search_target_file"] = matches[idx][0]
         await proceed_search_action(query, st, action)
@@ -4099,14 +4191,14 @@ async def _handle_callback(query, context, uid, data, st):
         result = await asyncio.to_thread(
             do_delete_sync, PROJECT_DIR, st.get("search_text", ""), st.get("search_target_file")
         )
-        await query.edit_message_text(result, reply_markup=main_menu_kb())
+        await query.edit_message_text(result, reply_markup=None)
     elif data == "confirm_replace":
         await query.edit_message_text("⏳ جاري الاستبدال...")
         result = await asyncio.to_thread(
             do_replace_sync, PROJECT_DIR, st.get("search_text", ""), st.get("replace_text", ""),
             st.get("search_target_file"),
         )
-        await query.edit_message_text(result, reply_markup=main_menu_kb())
+        await query.edit_message_text(result, reply_markup=None)
 
     # ── استبدال ملف/ملفات بمطابقة الاسم تلقائي ──
     elif data == "menu_search_filename":
@@ -4120,14 +4212,14 @@ async def _handle_callback(query, context, uid, data, st):
     elif data.startswith("pathpick:"):
         candidates = st.get("path_replace_candidates")
         if not candidates:
-            await query.edit_message_text("❌ حصل خطأ (الطلب ده مش متاح دلوقتي)، جرب تاني من القائمة.", reply_markup=main_menu_kb())
+            await query.edit_message_text("❌ حصل خطأ (الطلب ده مش متاح دلوقتي)، جرب تاني من القائمة.", reply_markup=None)
             return
         try:
             idx = int(data.split(":", 1)[1])
         except ValueError:
             idx = -1
         if idx < 0 or idx >= len(candidates):
-            await query.edit_message_text("❌ حصل خطأ، جرب تاني من القائمة.", reply_markup=main_menu_kb())
+            await query.edit_message_text("❌ حصل خطأ، جرب تاني من القائمة.", reply_markup=None)
             return
         st.pop("path_replace_candidates", None)
         st["path_replace_target"] = candidates[idx]
@@ -4143,7 +4235,7 @@ async def _handle_callback(query, context, uid, data, st):
         item = st.get("fnreplace_current")
         queue = st.get("fnreplace_queue", [])
         if not item or not queue or queue[0] is not item:
-            await query.edit_message_text("❌ حصل خطأ (الطلب ده مش متاح دلوقتي)، جرب تاني من القائمة.", reply_markup=main_menu_kb())
+            await query.edit_message_text("❌ حصل خطأ (الطلب ده مش متاح دلوقتي)، جرب تاني من القائمة.", reply_markup=None)
             return
 
         report = st.get("fnreplace_report", {"replaced": [], "skipped": []})
@@ -4156,7 +4248,7 @@ async def _handle_callback(query, context, uid, data, st):
                 idx = -1
             rel_paths = item["rel_paths"]
             if idx < 0 or idx >= len(rel_paths):
-                await query.edit_message_text("❌ حصل خطأ، جرب تاني من القائمة.", reply_markup=main_menu_kb())
+                await query.edit_message_text("❌ حصل خطأ، جرب تاني من القائمة.", reply_markup=None)
                 return
             target_rel = rel_paths[idx]
             result = await asyncio.to_thread(replace_file_sync, PROJECT_DIR, target_rel, item["local_path"])
@@ -4177,7 +4269,7 @@ async def _handle_callback(query, context, uid, data, st):
                 reply_markup=build_fnreplace_kb(next_item["rel_paths"]),
             )
         else:
-            await query.edit_message_text(finalize_fnreplace_report(st), reply_markup=main_menu_kb())
+            await query.edit_message_text(finalize_fnreplace_report(st), reply_markup=None)
 
     # ── نشر تطبيق على الموقع ──
     elif data == "menu_publish_app":
@@ -4232,7 +4324,7 @@ async def _handle_callback(query, context, uid, data, st):
     elif data == "chpub_yes":
         app_data = st.get("last_published_app")
         if not app_data:
-            await query.edit_message_text("❌ مفيش تطبيق محفوظ حاليًا عشان أنشره في القناة.", reply_markup=main_menu_kb())
+            await query.edit_message_text("❌ مفيش تطبيق محفوظ حاليًا عشان أنشره في القناة.", reply_markup=None)
             return
         await query.edit_message_text("⏳ جاري النشر في القناة...")
         ok, msg = await post_app_to_channel(context.bot, app_data)
@@ -4249,7 +4341,7 @@ async def _handle_callback(query, context, uid, data, st):
             do_insert_after_sync, PROJECT_DIR, st.get("search_text", ""), st.get("insert_text", ""),
             st.get("search_target_file"),
         )
-        await query.edit_message_text(result, reply_markup=main_menu_kb())
+        await query.edit_message_text(result, reply_markup=None)
 
     # ── classes.zip ──
     elif data == "menu_classes":
@@ -4347,7 +4439,7 @@ async def _handle_callback(query, context, uid, data, st):
         apk_path = get_state(uid).get("downloaded_apk_path", "")
         apk_name = get_state(uid).get("original_apk_name", "app.apk")
         if not apk_path or not os.path.isfile(apk_path):
-            await query.edit_message_text("❌ الملف مش موجود.", reply_markup=main_menu_kb())
+            await query.edit_message_text("❌ الملف مش موجود.", reply_markup=None)
             return
         await query.edit_message_text("⏳ جاري الإرسال على تيليجرام...")
         try:
@@ -4367,11 +4459,11 @@ async def _handle_callback(query, context, uid, data, st):
     elif data == "dl_decompile":
         apk_path = get_state(uid).get("downloaded_apk_path", "")
         if not apk_path or not os.path.isfile(apk_path):
-            await query.edit_message_text("❌ الملف مش موجود.", reply_markup=main_menu_kb())
+            await query.edit_message_text("❌ الملف مش موجود.", reply_markup=None)
             return
         ok_jar, jar_msg = verify_jar_file(BAKSMALI_JAR)
         if not ok_jar:
-            await query.edit_message_text(jar_msg, reply_markup=main_menu_kb())
+            await query.edit_message_text(jar_msg, reply_markup=None)
             return
         # انسخ الملف لمسار الـ APK الأساسي وافكه
         shutil.copy2(apk_path, APK_COPY_PATH)
@@ -4394,7 +4486,7 @@ async def _handle_callback(query, context, uid, data, st):
             await msg.edit_text(f"✅ تم فك الـ APK بنجاح في {format_duration(elapsed)}.\n" + tail_log(log_text))
             await context.bot.send_message(query.message.chat_id, "📋 القائمة الرئيسية:", reply_markup=main_menu_kb())
         else:
-            await msg.edit_text("❌ فشلت عملية الفك:\n" + tail_log(log_text, 1500), reply_markup=main_menu_kb())
+            await msg.edit_text("❌ فشلت عملية الفك:\n" + tail_log(log_text, 1500), reply_markup=None)
 
     # ── حذف / ريستارت ──
     elif data == "menu_delete_project":
