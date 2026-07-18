@@ -1450,6 +1450,31 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =============================================================================
 # استقبال الملفات
 # =============================================================================
+async def download_document_safe(update: Update, doc, dest_path: str) -> bool:
+    """بتنزّل ملف تليجرام لمسار معين، وبترجع True لو نجحت. لو الملف أكبر من
+    حد الـ Bot API (20MB) بتبعت للمستخدم رسالة واضحة توضح إن ده حد ثابت
+    ومش هيتحل بإعادة المحاولة، وبترجع False بدل ما تسيب الاستثناء يتفلت
+    لمعالج الأخطاء العام ويتصنّف غلط كـ"تأخير شبكة عابر"."""
+    from telegram.error import BadRequest
+    try:
+        f = await doc.get_file()
+        await f.download_to_drive(dest_path)
+        return True
+    except BadRequest as e:
+        if "file is too big" in str(e).lower():
+            await update.message.reply_text(
+                "🚫 الملف ده أكبر من 20MB، وده أقصى حجم يقدر بوت تليجرام العادي "
+                "ينزّله (حد ثابت من تليجرام مش مشكلة شبكة). ابعت ملف أصغر، أو "
+                "لو محتاج تنزّل ملفات أكبر كلم محمد يشغّل Local Bot API Server.",
+                reply_markup=main_menu_kb(),
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ فشل تنزيل الملف: {e}", reply_markup=main_menu_kb(),
+            )
+        return False
+
+
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not is_admin(uid):
@@ -1463,8 +1488,8 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not name.endswith(".zip"):
             await update.message.reply_text("❌ من فضلك ابعت ملف .zip فقط.")
             return
-        f = await doc.get_file()
-        await f.download_to_drive(CLASSES_ZIP_PATH)
+        if not await download_document_safe(update, doc, CLASSES_ZIP_PATH):
+            return
         st.pop("await", None)
         await update.message.reply_text("✅ تم استبدال classes.zip بنجاح.", reply_markup=main_menu_kb())
         return
@@ -1475,8 +1500,8 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         ks_name = st.get("new_ks_name") or random_string(6)
         dest    = os.path.join(KEYSTORES_DIR, f"{ks_name}.jks")
-        f       = await doc.get_file()
-        await f.download_to_drive(dest)
+        if not await download_document_safe(update, doc, dest):
+            return
         st["new_ks_path"] = dest
         st["await"]       = "keystore_alias"
         await update.message.reply_text("✅ تم استلام ملف الـ keystore.\n✍️ دلوقتي اكتب الـ Alias:")
@@ -1493,8 +1518,9 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tmp_dir = os.path.join(WORKSPACE_DIR, f"pathreplace_{random_string(6)}")
         os.makedirs(tmp_dir, exist_ok=True)
         tmp_path = os.path.join(tmp_dir, doc.file_name or "file")
-        f = await doc.get_file()
-        await f.download_to_drive(tmp_path)
+        if not await download_document_safe(update, doc, tmp_path):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return
 
         result = await asyncio.to_thread(replace_file_sync, PROJECT_DIR, target_rel, tmp_path)
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -1510,8 +1536,9 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tmp_dir = os.path.join(WORKSPACE_DIR, f"fnreplace_{random_string(6)}")
         os.makedirs(tmp_dir, exist_ok=True)
         tmp_path = os.path.join(tmp_dir, doc.file_name or "file")
-        f = await doc.get_file()
-        await f.download_to_drive(tmp_path)
+        if not await download_document_safe(update, doc, tmp_path):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return
 
         incoming = {}  # اسم الملف → مسار الملف على الديسك
         if name.endswith(".zip"):
@@ -1582,8 +1609,9 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         get_state(uid)["original_apk_name"] = original_apk_name
 
         msg = await update.message.reply_text("⏳ جاري تحميل ملف الـ APK...")
-        f   = await doc.get_file()
-        await f.download_to_drive(APK_COPY_PATH)
+        if not await download_document_safe(update, doc, APK_COPY_PATH):
+            await msg.delete()
+            return
 
         if os.path.isdir(PROJECT_DIR):
             shutil.rmtree(PROJECT_DIR, ignore_errors=True)
@@ -3550,13 +3578,49 @@ def build_site_app_url(app_data: dict) -> str:
     return f"{base}?app={slug}"
 
 
-def build_channel_message(app_data: dict, site_url: str) -> str:
+def _short_description(desc: str, limit: int = 90) -> str:
+    """بترجع مقتطف صغير جدًا من الوصف (كلمات مفتاحية بس، مش فقرة كاملة)."""
+    original = (desc or "").strip()
+    if not original:
+        return ""
+    truncated = original
+    was_cut = False
+    m = re.search(r"[.!؟]\s", original)
+    if m and m.start() <= limit:
+        truncated = original[:m.start()]
+    elif len(original) > limit:
+        truncated = original[:limit].rstrip()
+        was_cut = True
+    truncated = truncated.strip().rstrip(".،,")
+    return truncated + ("…" if was_cut else "")
+
+
+async def fetch_bilingual_app_name(package_id: str) -> tuple[str, str]:
+    """بيجيب اسم التطبيق بالإنجليزي والعربي من Google Play (لو متاح)، عشان
+    يتحط في أول رسالة القناة بالشكل: "ChatGPT - شات جي بي تي". لو مقدرش
+    يجيب واحد منهم أو كانوا متطابقين، بيرجع الفاضي في المكان المناسب."""
+    if not (_GPLAY_AVAILABLE and package_id):
+        return "", ""
+
+    def _fetch(lang: str, country: str) -> str:
+        try:
+            data = _gplay_app_fetch(package_id, lang=lang, country=country)
+            return (data.get("title") or "").strip()
+        except Exception:
+            return ""
+
+    name_en = await asyncio.to_thread(_fetch, "en", "us")
+    name_ar = await asyncio.to_thread(_fetch, "ar", "eg")
+    if name_en and name_ar and name_en.strip().lower() == name_ar.strip().lower():
+        name_ar = ""  # نفس الاسم بالظبط، مفيش داعي نكرره
+    return name_en, name_ar
+
+
+def build_channel_message(app_data: dict, site_url: str, name_en: str = "", name_ar: str = "") -> str:
     name  = app_data.get("name", "").strip()
     dev   = app_data.get("developer", "").strip()
     cat   = _CATEGORY_LABELS().get(app_data.get("category", ""), app_data.get("category", ""))
-    desc  = (app_data.get("description") or "").strip()
-    if len(desc) > 300:
-        desc = desc[:300].rstrip() + "…"
+    desc  = _short_description(app_data.get("description") or "", limit=50)
     rating = app_data.get("rating") or 0
     rcount = app_data.get("ratingCount") or 0
     size   = (app_data.get("size") or "").strip()
@@ -3579,12 +3643,43 @@ def build_channel_message(app_data: dict, site_url: str) -> str:
         extra.append(f"🔢 v{version}")
     if extra:
         lines.append(" | ".join(extra))
+
+    # ── بلوك الوصف: أول سطر الاسم بالإنجليزي والعربي (كلمة مفتاحية)،
+    # وبعده جملة قصيرة جدًا من الوصف الأصلي. ده البلوك الوحيد اللي بنقصره
+    # لو الرسالة كلها طلعت أطول من اللازم (تحت). ─────────────────────────
+    if name_en and name_ar:
+        bilingual_name = f"{name_en} - {name_ar}"
+    else:
+        bilingual_name = name_en or name_ar or ""
+
+    desc_lines = []
+    if bilingual_name:
+        desc_lines.append(_html_lib.escape(bilingual_name))
     if desc:
+        desc_lines.append(_html_lib.escape(desc))
+    desc_block = "\n".join(desc_lines)
+
+    if desc_block:
         lines.append("")
-        lines.append(_html_lib.escape(desc))
+        lines.append(desc_block)
     lines.append("")
     lines.append(f"⬇️ للتحميل: {site_url}")
-    return "\n".join(lines)
+    text = "\n".join(lines)
+
+    # ── شبكة أمان نهائية: أقصى حد كابشن الصورة في تليجرام 1024 حرف (وده
+    # أضيق حد بنستخدمه، لأن الرسالة ممكن تتبعت كابشن تحت صورة). لو الرسالة
+    # طلعت أطول من كده لأي سبب (اسم مطور طويل جدًا، تصنيف غريب...)، بنقص
+    # بلوك الوصف الأول، وبعدين بنقص أي حاجة زيادة من آخر النص لو لسه طويل.
+    # كده مستحيل تحصل "Message_too_long" تاني من الرسالة دي. ──────────────
+    SAFE_LIMIT = 1000
+    if len(text) > SAFE_LIMIT and desc_block:
+        overflow = len(text) - SAFE_LIMIT
+        keep = max(0, len(desc_block) - overflow - 1)
+        new_desc_block = (desc_block[:keep].rstrip() + "…") if keep > 0 else ""
+        text = text.replace(desc_block, new_desc_block, 1)
+    if len(text) > SAFE_LIMIT:
+        text = text[:SAFE_LIMIT - 1].rstrip() + "…"
+    return text
 
 
 async def post_app_to_channel(bot, app_data: dict, site_url: str = "") -> tuple[bool, str]:
@@ -3596,7 +3691,8 @@ async def post_app_to_channel(bot, app_data: dict, site_url: str = "") -> tuple[
     if not site_url:
         return False, "❌ مقدرتش أبني رابط صفحة التطبيق على الموقع (تأكد من site_app_page_url و Package ID)."
 
-    caption = build_channel_message(app_data, site_url)
+    name_en, name_ar = await fetch_bilingual_app_name((app_data.get("packageId") or "").strip())
+    caption = build_channel_message(app_data, site_url, name_en=name_en, name_ar=name_ar)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬇️ تحميل التطبيق", url=site_url)]])
 
     photo_url = (app_data.get("headerImage") or "").strip() or (app_data.get("icon") or "").strip()
@@ -4254,6 +4350,44 @@ async def _handle_callback(query, context, uid, data, st):
 # =============================================================================
 async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
     import traceback
+    from telegram.error import BadRequest
+
+    # ── تنبيه: BadRequest هو subclass من NetworkError في المكتبة دي، فلازم
+    # نتعامل معاه قبل شرط NetworkError العام، وإلا هيقع في التصنيف الغلط
+    # ("تأخير عابر، هيتحل لوحده") مع إنه في الحقيقة خطأ دائم (حجم ملف/طول
+    # رسالة) مش هيتحل بإعادة المحاولة أبدًا. ──────────────────────────────
+    if isinstance(context.error, BadRequest):
+        err_text = str(context.error)
+        low = err_text.lower()
+        if "file is too big" in low:
+            explain = (
+                "🚫 الملف اللي البوت بيحاول ينزّله من تليجرام أكبر من الحد المسموح به "
+                "عن طريق Bot API العادي (20MB أقصى تحميل). ده حد ثابت من تليجرام، "
+                "مش مشكلة شبكة، ومش هيتحل بإعادة المحاولة.\n"
+                "الحل: إما تبعت/تحوّل ملف أصغر من 20MB، أو تشغّل Local Bot API Server "
+                "بتاعك (بيرفع الحد لـ 2000MB)."
+            )
+        elif "message is too long" in low or "message_too_long" in low:
+            explain = (
+                "🚫 النص اللي البوت حاول يبعته أطول من حد تليجرام (4096 حرف للرسائل "
+                "العادية، 1024 حرف لو كابشن تحت صورة). ده حد ثابت، مش مشكلة شبكة، "
+                "ومش هيتحل بإعادة المحاولة.\n"
+                "الحل: تقصير النص (مثلاً وصف التطبيق) قبل الإرسال أو تقسيمه لأكتر من رسالة."
+            )
+        else:
+            explain = f"⚠️ طلب اترفض من تليجرام (Bad Request) — خطأ دائم مش عابر: {err_text}"
+
+        log.warning(f"🚫 BadRequest دائم (مش تأخير شبكة): {err_text}")
+        admins = CFG.get("admin_ids") or []
+        for admin_id in admins:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"{explain}\n(Instance: {INSTANCE_ID})",
+                )
+            except Exception:
+                pass
+        return
 
     # ── TimedOut / NetworkError عادةً مجرد تهنيقة شبكة عابرة (خصوصًا على
     # Railway)، مش باج فعلي في الكود — مكتبة python-telegram-bot بتعيد
