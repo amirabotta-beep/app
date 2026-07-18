@@ -3495,6 +3495,17 @@ async def finalize_publish(bot, chat_id, st):
     if not seo_slug:
         seo_slug = pkg.replace(".", "-") if pkg else ""
 
+    # ── نفس فكرة اسم التطبيق بالإنجليزي والعربي في أول رسالة القناة،
+    # لكن هنا من غير ما نقصّر باقي الوصف (وصف الموقع بيتعرض كامل) ──────────
+    name_en, name_ar = await fetch_bilingual_app_name(pkg)
+    if name_en and name_ar:
+        bilingual_name = f"{name_en} - {name_ar}"
+    else:
+        bilingual_name = name_en or name_ar or ""
+    full_description = d.get("description", "").strip()
+    if bilingual_name and not full_description.startswith(bilingual_name):
+        full_description = f"{bilingual_name}\n\n{full_description}" if full_description else bilingual_name
+
     now_iso = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
     app_data = {
@@ -3510,7 +3521,7 @@ async def finalize_publish(bot, chat_id, st):
         "ratingCount": d.get("ratingCount", 0) or 0,
         "size": d.get("size", "").strip(),
         "installs": d.get("installs", "").strip(),
-        "description": d.get("description", "").strip(),
+        "description": full_description,
         "conditions": d.get("conditions", []) or [],
         "badge": d.get("badge", ""),
         "status": d.get("status") or "active",
