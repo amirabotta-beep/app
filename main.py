@@ -174,6 +174,20 @@ DEFAULT_CONFIG = {
     # string)، وهيتضاف له "?app=<packageId بعد استبدال النقط بشرطات>"
     # تلقائيًا. مثال: https://volttechcode.github.io/web/app-page.html
     "site_app_page_url"       : "https://volttechcode.github.io/web/app-page.html",
+    # ── Local Bot API Server (اختياري) — لرفع حد حجم الملفات من 20/50MB لـ 2GB ──
+    # local_bot_api_enabled : فعّل/عطّل استخدام السيرفر المحلي (True/False)
+    # local_bot_api_url     : رابط السيرفر المحلي بتاعك، مثال: "http://localhost:8081"
+    #                         (لو شغّلته Docker على نفس السيرفر/Railway service تاني)
+    # local_bot_api_local_mode : سيبها True لو شغّلت السيرفر بوضع --local (الوضع
+    #                         الموصى بيه، بيدّي مسارات ملفات على القرص مباشرة)
+    # telegram_api_id/hash  : بيانات الحصول عليها من my.telegram.org — مش بيستخدمهم
+    #                         البوت نفسه، بس بنحفظهم هنا للمرجعية لأنك محتاجهم
+    #                         تحطهم كـ Environment Variables لسيرفر telegram-bot-api
+    "local_bot_api_enabled"   : False,
+    "local_bot_api_url"       : "http://localhost:8081",
+    "local_bot_api_local_mode": True,
+    "telegram_api_id"         : "",
+    "telegram_api_hash"       : "",
 }
 
 
@@ -1006,6 +1020,90 @@ async def check_tools_flow(query):
     )
 
 
+# =============================================================================
+# Local Bot API Server — لرفع حد حجم تحميل/رفع الملفات من 20/50MB لـ 2000MB
+# =============================================================================
+def local_bot_api_kb():
+    enabled = bool(CFG.get("local_bot_api_enabled"))
+    rows = [
+        [InlineKeyboardButton(
+            "🔴 تعطيل" if enabled else "🟢 تفعيل",
+            callback_data="lbas_toggle",
+        )],
+        [InlineKeyboardButton("✏️ تعديل رابط السيرفر (URL)", callback_data="lbas_edit_url")],
+        [InlineKeyboardButton("📘 إزاي أجيب المفاتيح (api_id / api_hash)", callback_data="lbas_guide")],
+        [InlineKeyboardButton("⬅️ رجوع", callback_data="back_main")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def local_bot_api_status_text():
+    enabled = bool(CFG.get("local_bot_api_enabled"))
+    url     = CFG.get("local_bot_api_url") or "غير محدد"
+    api_id  = CFG.get("telegram_api_id") or "—"
+    return (
+        "🖥️ Local Bot API Server\n\n"
+        f"الحالة: {'🟢 مفعّل' if enabled else '🔴 معطّل'}\n"
+        f"رابط السيرفر: `{url}`\n"
+        f"api_id المحفوظ (للمرجعية بس): `{api_id}`\n\n"
+        "لو مفعّل، البوت هيحمّل/يرفع الملفات عن طريق السيرفر ده بدل سيرفرات "
+        "تليجرام الرسمية، وده بيرفع حد حجم الملف من 20/50MB لـ 2000MB.\n\n"
+        "⚠️ لازم تكون شغّلت فعلاً كونتينر/برنامج telegram-bot-api على السيرفر "
+        "بتاعك الأول (السيرفر ده منفصل عن كود البوت، شوف زرار «إزاي أجيب "
+        "المفاتيح» تحت لتفاصيل التشغيل)، وبعد أي تغيير هنا لازم تعمل "
+        "«ريستارت كامل» من القائمة عشان يتفعّل."
+    )
+
+
+async def show_local_bot_api_menu(query):
+    await query.edit_message_text(
+        local_bot_api_status_text(), reply_markup=local_bot_api_kb(),
+    )
+
+
+async def toggle_local_bot_api(query):
+    CFG["local_bot_api_enabled"] = not bool(CFG.get("local_bot_api_enabled"))
+    save_config(CFG)
+    await query.edit_message_text(
+        local_bot_api_status_text()
+        + "\n\n✅ اتحفظ. متنساش تعمل «ريستارت كامل» من القائمة عشان يتفعّل التغيير.",
+        reply_markup=local_bot_api_kb(),
+    )
+
+
+async def show_local_bot_api_guide(query):
+    text = (
+        "📘 إزاي تجيب api_id و api_hash؟\n\n"
+        "1️⃣ روح على my.telegram.org وسجّل دخول برقم تليجرامك (حسابك الشخصي، مش البوت).\n"
+        "2️⃣ ادخل API development tools.\n"
+        "3️⃣ املا اسم أي تطبيق وهمي (مش لازم يكون حقيقي) وادوس Create.\n"
+        "4️⃣ هيديك api_id (رقم) و api_hash (نص طويل) — دول بيانات سرّية، محدش يشوفهم غيرك.\n\n"
+        "🐳 بعد كده شغّل سيرفر telegram-bot-api على سيرفرك (مثلاً بـ Docker):\n\n"
+        "docker run -d -p 8081:8081 \\\n"
+        "  -v telegram-bot-api-data:/var/lib/telegram-bot-api \\\n"
+        "  -e TELEGRAM_API_ID=<api_id> \\\n"
+        "  -e TELEGRAM_API_HASH=<api_hash> \\\n"
+        "  -e TELEGRAM_LOCAL=1 \\\n"
+        "  aiogram/telegram-bot-api:latest\n\n"
+        "5️⃣ بعد ما يشتغل، رجّع هنا واضغط «تعديل رابط السيرفر» وحط رابطه "
+        "(مثلاً http://localhost:8081، أو رابط الـ service التاني لو Railway).\n"
+        "6️⃣ اضغط «تفعيل»، وبعدين «ريستارت كامل» من القائمة.\n\n"
+        "ℹ️ api_id/api_hash بيتحطوا كـ Environment Variables لسيرفر telegram-bot-api "
+        "نفسه (زي الأمر فوق)، مش في كود البوت — البوت بس محتاج يعرف رابط السيرفر."
+    )
+    await query.edit_message_text(text, reply_markup=local_bot_api_kb())
+
+
+async def start_local_bot_api_url_edit(query, st):
+    st["await"] = "local_bot_api_url"
+    current = CFG.get("local_bot_api_url") or "http://localhost:8081"
+    await query.edit_message_text(
+        f"✏️ الرابط الحالي: `{current}`\n\n"
+        "ابعت رابط السيرفر المحلي الجديد (مثال: http://localhost:8081 أو رابط "
+        "الـ service بتاعك لو مستضيف السيرفر منفصل)، من غير / في الآخر."
+    )
+
+
 async def send_long_text(context, chat_id, text):
     if len(text) <= 3500:
         await context.bot.send_message(chat_id=chat_id, text=text)
@@ -1393,6 +1491,8 @@ MAIN_MENU_LAYOUT = [
     ["🆔 User UID", "📧 بيانات Firebase"],
     # الإدارة
     ["📦 نقل classes.zip", "🔑 شهادات التوقيع"],
+    # Local Bot API Server (رفع حد حجم الملفات)
+    ["🖥️ Local Bot API Server"],
     # منطقة الخطر
     ["🗑 حذف المشروع الحالي"],
     ["♻️ إعادة ستارت", "🔄 ريستارت كامل"],
@@ -1416,6 +1516,7 @@ MAIN_MENU_TEXT_TO_ACTION = {
     "📧 بيانات Firebase": "menu_update_firebase_login",
     "📦 نقل classes.zip": "menu_classes",
     "🔑 شهادات التوقيع": "menu_keystores",
+    "🖥️ Local Bot API Server": "menu_local_bot_api",
     "🗑 حذف المشروع الحالي": "menu_delete_project",
     "♻️ إعادة ستارت": "menu_soft_restart",
     "🔄 ريستارت كامل": "menu_full_restart",
@@ -1745,6 +1846,24 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if awaiting == "path_replace_query":
         await handle_path_replace_query(update, st, text)
+        return
+
+    if awaiting == "local_bot_api_url":
+        new_url = text.strip().rstrip("/")
+        st.pop("await", None)
+        if not (new_url.startswith("http://") or new_url.startswith("https://")):
+            await update.message.reply_text(
+                "❌ ده مش رابط سليم، لازم يبدأ بـ http:// أو https://. ابعته تاني:"
+            )
+            st["await"] = "local_bot_api_url"
+            return
+        CFG["local_bot_api_url"] = new_url
+        save_config(CFG)
+        await update.message.reply_text(
+            f"✅ اتحفظ رابط السيرفر: `{new_url}`\n\n"
+            "متنساش تفعّل الخاصية (لو لسه معطّلة) وتعمل «ريستارت كامل» من القائمة "
+            "عشان التغيير يتفعّل."
+        )
         return
 
     if awaiting == "new_github_token":
@@ -4360,6 +4479,16 @@ async def _handle_callback(query, context, uid, data, st):
     elif data == "menu_check_tools":
         await check_tools_flow(query)
 
+    # ── Local Bot API Server ──
+    elif data == "menu_local_bot_api":
+        await show_local_bot_api_menu(query)
+    elif data == "lbas_toggle":
+        await toggle_local_bot_api(query)
+    elif data == "lbas_guide":
+        await show_local_bot_api_guide(query)
+    elif data == "lbas_edit_url":
+        await start_local_bot_api_url_edit(query, st)
+
     # ── إدارة التوقيعات ──
     elif data == "menu_keystores":
         await show_keystores_management(query)
@@ -4615,13 +4744,24 @@ def main():
         write_timeout=30.0,
         pool_timeout=30.0,
     )
-    app = (
-        Application.builder()
-        .token(token)
-        .request(request)
-        .get_updates_request(get_updates_request)
-        .build()
-    )
+
+    # ── Local Bot API Server (اختياري) ──────────────────────────────────────
+    # لو مفعّل في الإعدادات، بنوجّه كل طلبات البوت (تحميل/رفع/رسائل) لسيرفر
+    # تليجرام المحلي بدل api.telegram.org، عشان نتخطى حد الـ 20MB/50MB.
+    builder = Application.builder().token(token).request(request).get_updates_request(get_updates_request)
+
+    local_url = (CFG.get("local_bot_api_url") or "").strip().rstrip("/")
+    if CFG.get("local_bot_api_enabled") and local_url:
+        base_url      = f"{local_url}/bot"
+        base_file_url = f"{local_url}/file/bot"
+        builder = builder.base_url(base_url).base_file_url(base_file_url)
+        # لو السيرفر شغال بوضع --local، اللي بيرجع local_mode=True في getFile
+        # (المسار بيبقى مسار على القرص مش رابط)، فعّل local_mode هنا كمان.
+        if CFG.get("local_bot_api_local_mode", True):
+            builder = builder.local_mode(True)
+        print(f"🖥️ Local Bot API Server مفعّل: {local_url}")
+
+    app = builder.build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu",  cmd_menu))
     app.add_handler(CallbackQueryHandler(on_callback))
