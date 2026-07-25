@@ -543,7 +543,7 @@ def download_java_sync():
             return False, "\n".join(steps), time.time() - start
 
     except Exception as e:
-        log(f"❌ خطأ: {e}")
+        log(_friendly_github_error(e))
         return False, "\n".join(steps), time.time() - start
 
 
@@ -821,6 +821,35 @@ async def check_java_flow(query):
 # فحص وتحميل أدوات APK (apktool.jar + uber-apk-signer.jar)
 # نفس فكرة زرار الجافا: تحقق أول، ولو ناقص/تالف نزّله من GitHub Releases مباشرة
 # =============================================================================
+def github_api_headers():
+    """هيدرز موحّدة لطلبات GitHub API. لو فيه github_token في config.json بيتضاف
+    كـ Authorization — ده بيرفع حد الطلبات من 60/ساعة (بدون توكن، لكل IP، وده
+    بيتشارك فيه غالبًا مع مستخدمين تانيين على نفس سيرفر الاستضافة فبينفد بسرعة)
+    لحد 5000/ساعة. من غير توكن هتفضل التنزيلات دي عرضة لخطأ 403 rate limit
+    exceeded بسهولة."""
+    headers = {"Accept": "application/vnd.github+json"}
+    token = CFG.get("github_token", "")
+    if token:
+        headers["Authorization"] = f"token {token}"
+    return headers
+
+
+
+
+def _friendly_github_error(e):
+    """بيرجع رسالة واضحة لو الخطأ فعليًا rate limit من GitHub API، بدل رسالة
+    الاستثناء التقنية اللي مش مفهومة للمستخدم العادي."""
+    resp = getattr(e, "response", None)
+    if resp is not None and resp.status_code == 403 and "rate limit" in (resp.text or "").lower():
+        return (
+            "❌ GitHub API رفض الطلب مؤقتًا (rate limit exceeded).\n"
+            "من غير توكن، الحد بيبقى 60 طلب/ساعة بس على مستوى الـ IP (وده ممكن "
+            "يتشارك فيه مستخدمين تانيين على نفس سيرفر الاستضافة، فبينفد بسرعة).\n"
+            "أضف توكن GitHub من زرار \"🐙 توكن GitHub\" في القائمة الرئيسية "
+            "عشان الحد يرتفع لـ 5000 طلب/ساعة، وحاول تاني بعد شوية."
+        )
+    return f"❌ خطأ: {e}"
+
 def download_tool_jar_sync(github_repo, name_contains, dest_path):
     """
     يجيب أحدث إصدار jar من GitHub Releases لمشروع معين ويحفظه في dest_path.
@@ -837,7 +866,7 @@ def download_tool_jar_sync(github_repo, name_contains, dest_path):
     try:
         log(f"🔎 جاري البحث عن أحدث إصدار في {github_repo}...")
         api_url = f"https://api.github.com/repos/{github_repo}/releases/latest"
-        r = requests.get(api_url, timeout=30, headers={"Accept": "application/vnd.github+json"})
+        r = requests.get(api_url, timeout=30, headers=github_api_headers())
         r.raise_for_status()
         assets = r.json().get("assets", [])
 
@@ -876,7 +905,7 @@ def download_tool_jar_sync(github_repo, name_contains, dest_path):
                 os.remove(tmp_path)
         except Exception:
             pass
-        log(f"❌ خطأ: {e}")
+        log(_friendly_github_error(e))
         return False, "\n".join(steps), time.time() - start
 
 
@@ -900,7 +929,7 @@ def download_smali_tool_jar_sync(kind, dest_path):
     try:
         log(f"🔎 جاري البحث عن أحدث إصدار {kind} في baksmali/smali...")
         api_url = "https://api.github.com/repos/baksmali/smali/releases/latest"
-        r = requests.get(api_url, timeout=30, headers={"Accept": "application/vnd.github+json"})
+        r = requests.get(api_url, timeout=30, headers=github_api_headers())
         r.raise_for_status()
         assets = r.json().get("assets", [])
 
@@ -936,7 +965,7 @@ def download_smali_tool_jar_sync(kind, dest_path):
                 os.remove(tmp_path)
         except Exception:
             pass
-        log(f"❌ خطأ: {e}")
+        log(_friendly_github_error(e))
         return False, "\n".join(steps), time.time() - start
 
 
