@@ -1902,8 +1902,31 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     report["skipped"].append((fname, "فشل الاستبدال"))
             else:
-                # الاسم ده موجود في أكتر من مكان → لازم تحدد إنت أنهي مكان بالظبط
-                queue.append({"fname": fname, "local_path": local_path, "rel_paths": rel_list})
+                # الاسم ده موجود في أكتر من مكان → أول حاجة نحاول نميّز
+                # تلقائيًا عن طريق مقارنة أول سطرين من الملف الجديد بأول
+                # سطرين من كل نسخة موجودة فعلاً في المشروع (تخمين إنها
+                # نفس النسخة الأصلية قبل التعديل).
+                similar_rels = await asyncio.to_thread(
+                    find_similar_matches_sync, PROJECT_DIR, local_path, rel_list
+                )
+                if len(similar_rels) == 1:
+                    # نسخة متشابهة واحدة بس → مفيش لبس فعلي، استبدال تلقائي
+                    # مباشر من غير ما نتعب المستخدم بسؤال يدوي
+                    result = await asyncio.to_thread(replace_file_sync, PROJECT_DIR, similar_rels[0], local_path)
+                    if result.startswith("✅"):
+                        report["replaced"].append((fname, similar_rels[0]))
+                    else:
+                        report["skipped"].append((fname, "فشل الاستبدال"))
+                else:
+                    # لسه فيه لبس (مفيش تشابه واضح، أو فيه كذا نسخة متشابهة
+                    # مع بعض) → لازم تحدد إنت يدوي، مع اقتراح استبدال كل
+                    # النسخ المتشابهة دفعة واحدة لو فيه أكتر من وحدة
+                    queue.append({
+                        "fname": fname,
+                        "local_path": local_path,
+                        "rel_paths": rel_list,
+                        "similar_rels": similar_rels,
+                    })
 
         st["fnreplace_report"]  = report
         st["fnreplace_queue"]   = queue
@@ -1913,8 +1936,8 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             item = queue[0]
             st["fnreplace_current"] = item
             await update.message.reply_text(
-                format_fnreplace_prompt(item["fname"], item["rel_paths"]),
-                reply_markup=build_fnreplace_kb(item["rel_paths"]),
+                format_fnreplace_prompt(item["fname"], item["rel_paths"], item.get("similar_rels")),
+                reply_markup=build_fnreplace_kb(item["rel_paths"], item.get("similar_rels")),
             )
         else:
             await update.message.reply_text(finalize_fnreplace_report(st), reply_markup=main_menu_kb())
@@ -3030,25 +3053,75 @@ def find_filename_matches_sync(project_dir, incoming_paths: dict):
     return {fname: name_to_paths.get(fname.lower(), []) for fname in incoming_paths}
 
 
-def build_fnreplace_kb(rel_paths):
+def read_first_lines_sync(path, n=2):
+    """يقرأ أول n سطر من ملف كنص، وبيرجّع لستة الأسطر بعد ما يشيل المسافات
+    الزيادة من كل سطر. بيرجّع None لو الملف مش موجود، أو باينري (مش قادر
+    يتقرا كـ UTF-8)، أو حصل أي خطأ تاني في القراءة."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="strict") as f:
+            lines = []
+            for _ in range(n):
+                line = f.readline()
+                if not line:
+                    break
+                lines.append(line.strip())
+            return lines
+    except Exception:
+        return None
+
+
+def find_similar_matches_sync(project_dir, local_path, rel_paths, n_lines=2):
+    """من بين كل الأماكن (rel_paths) اللي لقينا فيها ملف بنفس الاسم، بيرجّع
+    بس اللي أول (n_lines) سطر فيها متطابقين تمامًا مع أول (n_lines) سطر من
+    الملف الجديد المرفوع (local_path) — ده تخمين إن الملف ده هو نفس النسخة
+    (نفس المحتوى الأصلي) قبل التعديل. لو الملف الجديد أو أي ملف هدف مش
+    نصي (باينري) أو فاضي، بيتعامل معاه كـ "مش متشابه" (محافظة/أمان)."""
+    incoming_lines = read_first_lines_sync(local_path, n_lines)
+    if not incoming_lines:
+        return []
+    similar = []
+    for rel in rel_paths:
+        target_lines = read_first_lines_sync(os.path.join(project_dir, rel), n_lines)
+        if target_lines and target_lines == incoming_lines:
+            similar.append(rel)
+    return similar
+
+
+def build_fnreplace_kb(rel_paths, similar_rels=None):
     """أزرار مرقّمة لكل مكان لقينا فيه الاسم، عشان المستخدم يحدد المكان
     المطلوب بالظبط بضغطة واحدة (1، 2، 3، ...)، بدون ما نستبدل أي حاجة
-    تانية غير المكان ده."""
+    تانية غير المكان ده. لو فيه أكتر من نسخة متشابهة (نفس أول سطرين مع
+    الملف الجديد)، بيتضاف زرار إضافي لاستبدالهم كلهم دفعة واحدة."""
+    similar_rels = similar_rels or []
     rows = []
     for i, rel in enumerate(rel_paths):
-        label = f"{i + 1}️⃣ {rel}"
+        mark = "✅ " if rel in similar_rels else ""
+        label = f"{i + 1}️⃣ {mark}{rel}"
         if len(label) > 60:
             label = label[:57] + "..."
         rows.append([InlineKeyboardButton(label, callback_data=f"fnpick:{i}")])
+    if len(similar_rels) >= 2:
+        rows.append([InlineKeyboardButton(
+            f"➕ استبدال كل النسخ المتشابهة ({len(similar_rels)})", callback_data="fnpick:all"
+        )])
     rows.append([InlineKeyboardButton("⏭ تخطي هذا الملف (بدون استبدال)", callback_data="fnpick:skip")])
     return InlineKeyboardMarkup(rows)
 
 
-def format_fnreplace_prompt(fname, rel_paths):
+def format_fnreplace_prompt(fname, rel_paths, similar_rels=None):
+    similar_rels = similar_rels or []
     lines = [f"📄 الملف \"{fname}\" موجود في {len(rel_paths)} مكان مختلف داخل المشروع:\n"]
     for i, rel in enumerate(rel_paths):
-        lines.append(f"{i + 1}️⃣ {rel}")
-    lines.append("\n👇 اختار رقم المكان اللي عايز تستبدل الملف فيه بالظبط — هيتم الاستبدال في هذا المكان فقط، ومفيش أي تعديل تاني.")
+        mark = " ✅ (متشابه مع الملف الجديد)" if rel in similar_rels else ""
+        lines.append(f"{i + 1}️⃣ {rel}{mark}")
+    if len(similar_rels) >= 2:
+        lines.append(
+            f"\n🔎 لقيت {len(similar_rels)} نسخة متشابهة مع الملف الجديد (نفس أول سطرين)، "
+            "من غير ما أقدر أحدد واحدة بالظبط."
+        )
+        lines.append("👇 تقدر تستبدلهم كلهم دفعة واحدة، أو تختار مكان واحد بالظبط، أو تتخطى.")
+    else:
+        lines.append("\n👇 اختار رقم المكان اللي عايز تستبدل الملف فيه بالظبط — هيتم الاستبدال في هذا المكان فقط، ومفيش أي تعديل تاني.")
     return "\n".join(lines)
 
 
@@ -4534,6 +4607,21 @@ async def _handle_callback(query, context, uid, data, st):
         report = st.get("fnreplace_report", {"replaced": [], "skipped": []})
         if sel == "skip":
             report["skipped"].append((item["fname"], "تخطي يدوي"))
+        elif sel == "all":
+            similar_rels = item.get("similar_rels") or []
+            if len(similar_rels) < 2:
+                await query.edit_message_text("❌ حصل خطأ، جرب تاني من القائمة.", reply_markup=None)
+                return
+            ok_count = 0
+            for target_rel in similar_rels:
+                result = await asyncio.to_thread(replace_file_sync, PROJECT_DIR, target_rel, item["local_path"])
+                if result.startswith("✅"):
+                    report["replaced"].append((item["fname"], target_rel))
+                    ok_count += 1
+                else:
+                    report["skipped"].append((item["fname"], f"فشل الاستبدال ({target_rel})"))
+            if ok_count == 0:
+                report["skipped"].append((item["fname"], "فشل استبدال كل النسخ المتشابهة"))
         else:
             try:
                 idx = int(sel)
@@ -4558,8 +4646,8 @@ async def _handle_callback(query, context, uid, data, st):
             next_item = queue[0]
             st["fnreplace_current"] = next_item
             await query.edit_message_text(
-                format_fnreplace_prompt(next_item["fname"], next_item["rel_paths"]),
-                reply_markup=build_fnreplace_kb(next_item["rel_paths"]),
+                format_fnreplace_prompt(next_item["fname"], next_item["rel_paths"], next_item.get("similar_rels")),
+                reply_markup=build_fnreplace_kb(next_item["rel_paths"], next_item.get("similar_rels")),
             )
         else:
             await query.edit_message_text(finalize_fnreplace_report(st), reply_markup=None)
