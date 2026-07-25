@@ -218,6 +218,18 @@ def load_config():
     cfg["mtproto_api_id"]   = os.environ.get("API_ID", cfg.get("mtproto_api_id", ""))
     cfg["mtproto_api_hash"] = os.environ.get("API_HASH", cfg.get("mtproto_api_hash", ""))
 
+    # ── تنضيف تلقائي: أي عنصر في keystores مش dict فيه "name" (بيانات تالفة
+    # لأي سبب) بيتشال هنا بدل ما يفضل يسبب TypeError كل مرة حد يفتح قائمة
+    # التوقيعات. لو حصل تنضيف فعلي، بنحفظ الملف نظيف على طول.
+    raw_keystores = cfg.get("keystores", [])
+    clean_keystores = [k for k in raw_keystores if isinstance(k, dict) and k.get("name")]
+    if len(clean_keystores) != len(raw_keystores):
+        log.warning(
+            f"⚠️ اتشالت {len(raw_keystores) - len(clean_keystores)} عنصر تالف من "
+            "قائمة keystores في config.json (بيانات مش بالشكل المتوقع)."
+        )
+        cfg["keystores"] = clean_keystores
+
     return cfg
 
 
@@ -265,7 +277,7 @@ def is_admin(uid):
 
 def find_keystore(name):
     for k in CFG.get("keystores", []):
-        if k["name"] == name:
+        if isinstance(k, dict) and k.get("name") == name:
             return k
     return None
 
@@ -2681,7 +2693,7 @@ async def start_build_flow(query, uid):
 
 
 async def show_keystores_for_build(query):
-    kslist = CFG.get("keystores", [])
+    kslist = [k for k in CFG.get("keystores", []) if isinstance(k, dict) and k.get("name")]
     rows   = [[InlineKeyboardButton(f"🔑 {k['name']}", callback_data=f"ksbuild:{k['name']}")] for k in kslist]
     rows.append([InlineKeyboardButton("➕ توقيع يدوي جديد", callback_data="ksbuild_new")])
     rows.append([InlineKeyboardButton("⬅️ رجوع",          callback_data="back_main")])
@@ -4275,7 +4287,7 @@ async def do_classes_inject(query):
 # إدارة التوقيعات
 # =============================================================================
 async def show_keystores_management(query):
-    kslist = CFG.get("keystores", [])
+    kslist = [k for k in CFG.get("keystores", []) if isinstance(k, dict) and k.get("name")]
     rows   = [[InlineKeyboardButton(f"🗑 حذف: {k['name']}", callback_data=f"ksdel:{k['name']}")] for k in kslist]
     rows.append([InlineKeyboardButton("➕ إضافة توقيع جديد", callback_data="ksnew_standalone")])
     rows.append([InlineKeyboardButton("⬅️ رجوع",            callback_data="back_main")])
@@ -4290,7 +4302,7 @@ async def delete_keystore(query, name):
             os.remove(k["path"])
         except Exception:
             pass
-        CFG["keystores"] = [x for x in CFG["keystores"] if x["name"] != name]
+        CFG["keystores"] = [x for x in CFG["keystores"] if not (isinstance(x, dict) and x.get("name") == name)]
         save_config(CFG)
         await query.edit_message_text(f"✅ تم حذف التوقيع \"{name}\".", reply_markup=None)
     else:
