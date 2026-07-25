@@ -1589,17 +1589,33 @@ async def get_telethon_client():
             return _TELETHON_CLIENT
 
         try:
-            client = TelegramClient(StringSession(), int(api_id), api_hash)
-            await client.start(bot_token=bot_token)
+            client = TelegramClient(
+                StringSession(),
+                int(api_id),
+                api_hash,
+                connection_retries=5,   # يعيد المحاولة تلقائي بدل ما يستسلم من أول فشل اتصال
+                retry_delay=2,
+                timeout=30,             # مهلة كل عملية اتصال منفردة (مش التنزيل كله)
+                request_retries=5,
+                auto_reconnect=True,
+                flood_sleep_threshold=60,
+            )
+            await client.connect()
+            if not await client.is_user_authorized():
+                await client.sign_in(bot_token=bot_token)
             _TELETHON_CLIENT = client
             return client
         except Exception as e:
             log.warning(f"⚠️ فشل الاتصال بـ Telethon (MTProto): {e}")
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
             return None
 
 
 async def reset_telethon_client():
-    """بتقفل أي اتصال Telethon قديم — بتتنادى بعد تغيير API_ID/API_HASH."""
+    """بتقفل أي اتصال Telethon قديم — بتتنادى بعد تغيير API_ID/API_HASH أو بعد فشل/تعليق."""
     global _TELETHON_CLIENT
     async with _TELETHON_LOCK:
         if _TELETHON_CLIENT is not None:
@@ -1610,22 +1626,48 @@ async def reset_telethon_client():
             _TELETHON_CLIENT = None
 
 
-async def download_document_via_mtproto(chat_id: int, message_id: int, dest_path: str, timeout_seconds: int = 600):
+async def download_document_via_mtproto(chat_id: int, message_id: int, dest_path: str,
+                                         progress_msg=None, timeout_seconds: int = 1200):
     """بتنزّل ملف عن طريق Telethon مباشرة (بيتخطى حد الـ 20MB بتاع Bot API).
     بترجع (True, None) لو نجحت، أو (False, رسالة الخطأ) لو فشلت.
-    فيه مهلة قصوى (افتراضيًا 10 دقايق) عشان لو الاتصال عَلِق (زي لو الاستضافة
-    بتحجب الاتصال بمركز بيانات تليجرام التاني اللي الملف متخزّن فيه)، البوت
-    يرجع رسالة خطأ واضحة بدل ما يفضل واقف من غير رد لحد الأبد."""
+
+    - progress_msg: رسالة تليجرام (لو موجودة) بيتم تحديثها بنسبة التقدم أثناء
+      التنزيل، عشان يبقى واضح إن العملية شغالة وملهاش حل غير الانتظار.
+    - فيه مهلة قصوى (افتراضيًا 20 دقيقة) عشان لو الاتصال عَلِق فعليًا (زي لو
+      الاستضافة بتحجب الاتصال بمركز بيانات تليجرام اللي الملف متخزّن فيه)،
+      البوت يرجع رسالة خطأ واضحة بدل ما يفضل واقف من غير رد لحد الأبد.
+    """
     client = await get_telethon_client()
     if client is None:
         return False, None  # الميزة مش مفعّلة أو فشل الاتصال — نرجع للسلوك القديم
+
+    progress_state = {"last_time": 0.0, "last_pct": -1}
+
+    async def _on_progress(current, total):
+        if progress_msg is None or not total:
+            return
+        pct = int(current * 100 / total)
+        now = time.time()
+        # نحدّث كل ~5 ثواني أو كل ما النسبة تتغير 5% على الأقل — عشان
+        # منضربش limit تعديل الرسايل في تليجرام.
+        if pct == progress_state["last_pct"] or (now - progress_state["last_time"] < 5 and pct < 100):
+            return
+        progress_state["last_time"] = now
+        progress_state["last_pct"]  = pct
+        try:
+            await progress_msg.edit_text(
+                f"📡 جاري التنزيل عن طريق MTProto... {pct}% "
+                f"({current / (1024*1024):.1f}MB / {total / (1024*1024):.1f}MB)"
+            )
+        except Exception:
+            pass
 
     try:
         async def _do_download():
             msg = await client.get_messages(chat_id, ids=message_id)
             if msg is None or not (msg.document or msg.media):
                 return False, "❌ معرفش أوصل لنفس الرسالة عن طريق MTProto."
-            await client.download_media(msg, file=dest_path)
+            await client.download_media(msg, file=dest_path, progress_callback=_on_progress)
             return True, None
 
         return await asyncio.wait_for(_do_download(), timeout=timeout_seconds)
@@ -1635,12 +1677,14 @@ async def download_document_via_mtproto(chat_id: int, message_id: int, dest_path
         await reset_telethon_client()
         return False, (
             "🚫 التنزيل عن طريق MTProto علّق واستنينا "
-            f"{timeout_seconds // 60} دقايق من غير ما يخلص، فألغيناه.\n"
-            "الغالب إن سيرفر الاستضافة بيحجب الاتصال بمركز بيانات تليجرام "
-            "اللي الملف ده متخزّن عليه. جرب تاني (أحيانًا بتنجح من التانية)، "
-            "أو ابعت ملف أصغر لو المشكلة استمرت."
+            f"{timeout_seconds // 60} دقيقة من غير ما يخلص، فألغيناه.\n"
+            "الغالب إن سيرفر الاستضافة بيحجب أو بيبطّئ جدًا الاتصال بمركز بيانات "
+            "تليجرام اللي الملف ده متخزّن عليه (مشكلة شبكة/استضافة، مش في الكود). "
+            "جرب تاني (أحيانًا بتنجح من التانية لو المشكلة مؤقتة)، أو كلم الدعم "
+            "الفني بتاع الاستضافة يتأكد إن مفيش حجب على منافذ 443 لعناوين تليجرام."
         )
     except Exception as e:
+        await reset_telethon_client()
         return False, f"❌ فشل التنزيل عن طريق MTProto: {e}"
 
 
@@ -1660,12 +1704,13 @@ async def download_document_safe(update: Update, doc, dest_path: str) -> bool:
         if TELETHON_AVAILABLE and CFG.get("mtproto_api_id") and CFG.get("mtproto_api_hash"):
             mtproto_notice = await update.message.reply_text(
                 "📡 الملف أكبر من 20MB، بينزل عن طريق MTProto (ده بياخد وقت أطول "
-                "من المعتاد حسب حجم الملف وسرعة الاتصال، ياريت تستنى من غير ما تبعت تاني)..."
+                "من المعتاد حسب حجم الملف وسرعة الاتصال)..."
             )
         ok, err = await download_document_via_mtproto(
-            update.effective_chat.id, update.message.message_id, dest_path
+            update.effective_chat.id, update.message.message_id, dest_path,
+            progress_msg=mtproto_notice,
         )
-        if mtproto_notice is not None:
+        if mtproto_notice is not None and ok:
             try:
                 await mtproto_notice.delete()
             except Exception:
@@ -1673,7 +1718,13 @@ async def download_document_safe(update: Update, doc, dest_path: str) -> bool:
         if ok:
             return True
         if err:  # الميزة مفعّلة لكن فشلت فعليًا
-            await update.message.reply_text(err, reply_markup=main_menu_kb())
+            if mtproto_notice is not None:
+                try:
+                    await mtproto_notice.edit_text(err, reply_markup=None)
+                except Exception:
+                    await update.message.reply_text(err, reply_markup=main_menu_kb())
+            else:
+                await update.message.reply_text(err, reply_markup=main_menu_kb())
             return False
         # err is None يعني الميزة مش مفعّلة أصلاً — كمّل تحت لرسالة التنبيه المعتادة
 
