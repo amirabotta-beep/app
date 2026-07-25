@@ -47,6 +47,17 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 from telegram.error import TimedOut, NetworkError
 
+# ── Telethon (اختياري): بيسمح بتنزيل ملفات أكبر من حد الـ Bot API (20MB) ──
+# عن طريق الاتصال المباشر بـ MTProto (باستخدام API_ID/API_HASH من
+# my.telegram.org) بدل الـ HTTP API العادي. لو المكتبة مش متثبتة أو
+# المستخدم لسه ما فعّلش الميزة دي، البوت بيشتغل عادي وبيرجع لسلوكه القديم.
+try:
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+    TELETHON_AVAILABLE = True
+except ImportError:
+    TELETHON_AVAILABLE = False
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -174,6 +185,11 @@ DEFAULT_CONFIG = {
     # string)، وهيتضاف له "?app=<packageId بعد استبدال النقط بشرطات>"
     # تلقائيًا. مثال: https://volttechcode.github.io/web/app-page.html
     "site_app_page_url"       : "https://volttechcode.github.io/web/app-page.html",
+    # ── تحميل الملفات الكبيرة (تعدّي حد الـ Bot API 20MB) عن طريق MTProto ──
+    # API_ID و API_HASH بتاخدهم من https://my.telegram.org/apps (مجاني).
+    # لو الحقلين دول فاضيين، البوت هيفضل يستخدم الـ Bot API العادي (حد 20MB).
+    "mtproto_api_id"          : "",
+    "mtproto_api_hash"        : "",
 }
 
 
@@ -199,6 +215,8 @@ def load_config():
     cfg["firebase_admin_email"]    = os.environ.get("FIREBASE_ADMIN_EMAIL", cfg.get("firebase_admin_email", ""))
     cfg["firebase_admin_password"] = os.environ.get("FIREBASE_ADMIN_PASSWORD", cfg.get("firebase_admin_password", ""))
     cfg["firebase_owner_uid"]      = os.environ.get("FIREBASE_OWNER_UID", cfg.get("firebase_owner_uid", ""))
+    cfg["mtproto_api_id"]   = os.environ.get("API_ID", cfg.get("mtproto_api_id", ""))
+    cfg["mtproto_api_hash"] = os.environ.get("API_HASH", cfg.get("mtproto_api_hash", ""))
 
     return cfg
 
@@ -213,7 +231,8 @@ def save_config(cfg):
         if os.path.exists(CONFIG_PATH):
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 existing = json.load(f)
-            for secret_key in ("bot_token", "github_token", "firebase_admin_email", "firebase_admin_password"):
+            for secret_key in ("bot_token", "github_token", "firebase_admin_email", "firebase_admin_password",
+                               "mtproto_api_id", "mtproto_api_hash"):
                 if secret_key in existing:
                     to_write[secret_key] = existing[secret_key]
     except Exception:
@@ -1391,6 +1410,7 @@ MAIN_MENU_LAYOUT = [
     # البيانات والإعدادات — مجمّعين مع بعض
     ["🆔 آيدي القناة", "🐙 توكن GitHub"],
     ["🆔 User UID", "📧 بيانات Firebase"],
+    ["📡 تفعيل تحميل الملفات الكبيرة"],
     # الإدارة
     ["📦 نقل classes.zip", "🔑 شهادات التوقيع"],
     # منطقة الخطر
@@ -1414,6 +1434,7 @@ MAIN_MENU_TEXT_TO_ACTION = {
     "🐙 توكن GitHub": "menu_update_github_token",
     "🆔 User UID": "menu_update_owner_uid",
     "📧 بيانات Firebase": "menu_update_firebase_login",
+    "📡 تفعيل تحميل الملفات الكبيرة": "menu_update_mtproto",
     "📦 نقل classes.zip": "menu_classes",
     "🔑 شهادات التوقيع": "menu_keystores",
     "🗑 حذف المشروع الحالي": "menu_delete_project",
@@ -1537,24 +1558,119 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =============================================================================
 # استقبال الملفات
 # =============================================================================
+# =============================================================================
+# تحميل الملفات الكبيرة عن طريق MTProto (Telethon)
+# =============================================================================
+# الـ Bot API العادي (api.telegram.org) بيرفض تنزيل أي ملف أكبر من 20MB،
+# حتى لو التوكن والبوت شغالين تمام — ده حد ثابت من تليجرام في طبقة الـ
+# HTTP API نفسها. الحل: نتصل بنفس البوت لكن مباشرة عن طريق بروتوكول
+# MTProto (نفس البروتوكول اللي تطبيق تليجرام بيستخدمه) باستخدام API_ID
+# و API_HASH بتوع حساب على my.telegram.org. الاتصال ده مش بيه نفس القيد،
+# وبيسمح بتنزيل ملفات لحد 2 جيجابايت (أو 4 جيجا لو حساب البوت بريميوم).
+_TELETHON_CLIENT = None
+_TELETHON_LOCK = asyncio.Lock()
+
+
+async def get_telethon_client():
+    """بيرجع عميل Telethon جاهز ومتصل، أو None لو الميزة مش مفعّلة/فشل الاتصال."""
+    global _TELETHON_CLIENT
+
+    if not TELETHON_AVAILABLE:
+        return None
+
+    api_id   = str(CFG.get("mtproto_api_id") or "").strip()
+    api_hash = str(CFG.get("mtproto_api_hash") or "").strip()
+    bot_token = CFG.get("bot_token", "")
+    if not api_id or not api_hash or not bot_token:
+        return None
+
+    async with _TELETHON_LOCK:
+        if _TELETHON_CLIENT is not None and _TELETHON_CLIENT.is_connected():
+            return _TELETHON_CLIENT
+
+        try:
+            session_path = os.path.join(WORKSPACE_DIR, "mtproto_session")
+            client = TelegramClient(session_path, int(api_id), api_hash)
+            await client.start(bot_token=bot_token)
+            _TELETHON_CLIENT = client
+            return client
+        except Exception as e:
+            log.warning(f"⚠️ فشل الاتصال بـ Telethon (MTProto): {e}")
+            return None
+
+
+async def reset_telethon_client():
+    """بتقفل أي اتصال Telethon قديم — بتتنادى بعد تغيير API_ID/API_HASH."""
+    global _TELETHON_CLIENT
+    async with _TELETHON_LOCK:
+        if _TELETHON_CLIENT is not None:
+            try:
+                await _TELETHON_CLIENT.disconnect()
+            except Exception:
+                pass
+            _TELETHON_CLIENT = None
+
+
+async def download_document_via_mtproto(chat_id: int, message_id: int, dest_path: str):
+    """بتنزّل ملف عن طريق Telethon مباشرة (بيتخطى حد الـ 20MB بتاع Bot API).
+    بترجع (True, None) لو نجحت، أو (False, رسالة الخطأ) لو فشلت."""
+    client = await get_telethon_client()
+    if client is None:
+        return False, None  # الميزة مش مفعّلة أو فشل الاتصال — نرجع للسلوك القديم
+
+    try:
+        msg = await client.get_messages(chat_id, ids=message_id)
+        if msg is None or not (msg.document or msg.media):
+            return False, "❌ معرفش أوصل لنفس الرسالة عن طريق MTProto."
+        await client.download_media(msg, file=dest_path)
+        return True, None
+    except Exception as e:
+        return False, f"❌ فشل التنزيل عن طريق MTProto: {e}"
+
+
 async def download_document_safe(update: Update, doc, dest_path: str) -> bool:
     """بتنزّل ملف تليجرام لمسار معين، وبترجع True لو نجحت. لو الملف أكبر من
     حد الـ Bot API (20MB) بتبعت للمستخدم رسالة واضحة توضح إن ده حد ثابت
     ومش هيتحل بإعادة المحاولة، وبترجع False بدل ما تسيب الاستثناء يتفلت
     لمعالج الأخطاء العام ويتصنّف غلط كـ"تأخير شبكة عابر"."""
     from telegram.error import BadRequest
+
+    # الملفات فوق 20MB أصلاً مرفوضة من الـ Bot API قبل حتى ما نحاول —
+    # فنروح على طول لـ MTProto (لو مفعّل) بدل ما نضيّع وقت في محاولة فاشلة.
+    big_file = bool(doc.file_size and doc.file_size > 20 * 1024 * 1024)
+
+    if big_file:
+        ok, err = await download_document_via_mtproto(
+            update.effective_chat.id, update.message.message_id, dest_path
+        )
+        if ok:
+            return True
+        if err:  # الميزة مفعّلة لكن فشلت فعليًا
+            await update.message.reply_text(err, reply_markup=main_menu_kb())
+            return False
+        # err is None يعني الميزة مش مفعّلة أصلاً — كمّل تحت لرسالة التنبيه المعتادة
+
     try:
         f = await doc.get_file()
         await f.download_to_drive(dest_path)
         return True
     except BadRequest as e:
         if "file is too big" in str(e).lower():
-            await update.message.reply_text(
-                "🚫 الملف ده أكبر من 20MB، وده أقصى حجم يقدر بوت تليجرام العادي "
-                "ينزّله (حد ثابت من تليجرام مش مشكلة شبكة). ابعت ملف أصغر، أو "
-                "لو محتاج تنزّل ملفات أكبر كلم محمد يشغّل Local Bot API Server.",
-                reply_markup=main_menu_kb(),
-            )
+            if TELETHON_AVAILABLE and not (CFG.get("mtproto_api_id") and CFG.get("mtproto_api_hash")):
+                await update.message.reply_text(
+                    "🚫 الملف ده أكبر من 20MB، وده أقصى حجم يقدر بوت تليجرام العادي "
+                    "ينزّله من غير تفعيل التحميل الكبير.\n\n"
+                    "✅ تقدر تفعّله دلوقتي عن طريق زرار \"📡 تفعيل تحميل الملفات الكبيرة\" "
+                    "في القائمة الرئيسية، وهتقدر بعدها تنزّل لحد 2 جيجابايت.",
+                    reply_markup=main_menu_kb(),
+                )
+            else:
+                await update.message.reply_text(
+                    "🚫 الملف ده أكبر من 20MB، وده أقصى حجم يقدر بوت تليجرام العادي "
+                    "ينزّله (حد ثابت من تليجرام مش مشكلة شبكة). ابعت ملف أصغر، أو "
+                    "لو محتاج تنزّل ملفات أكبر كلم محمد يشغّل Local Bot API Server.",
+                    reply_markup=main_menu_kb(),
+                )
         else:
             await update.message.reply_text(
                 f"❌ فشل تنزيل الملف: {e}", reply_markup=main_menu_kb(),
@@ -1745,6 +1861,41 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if awaiting == "path_replace_query":
         await handle_path_replace_query(update, st, text)
+        return
+
+    if awaiting == "new_mtproto_api_id":
+        if not text.isdigit():
+            await update.message.reply_text("❌ الـ API_ID لازم يكون رقم فقط. ابعته تاني:")
+            return
+        st["tmp_mtproto_api_id"] = text
+        st["await"] = "new_mtproto_api_hash"
+        await update.message.reply_text(
+            "تمام ✅\n\nالخطوة 2/2: دلوقتي ابعتلي الـ API_HASH (النص اللي جنب API_ID في نفس الصفحة):"
+        )
+        return
+
+    if awaiting == "new_mtproto_api_hash":
+        st["tmp_mtproto_api_hash"] = text
+        st.pop("await", None)
+
+        # امسح رسالة المستخدم اللي فيها الـ API_HASH فورًا — أمان، عشان
+        # ميفضلش نص ظاهر في تاريخ الشات.
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        masked_id = st.get("tmp_mtproto_api_id", "")
+        await update.message.reply_text(
+            "راجع البيانات قبل الحفظ:\n\n"
+            f"API_ID: `{masked_id}`\n"
+            "API_HASH: `••••••••••••••••` (مخفي)\n\n"
+            "لو البيانات صح، دوس \"💾 حفظ\" عشان تتفعل ميزة تحميل الملفات الكبيرة.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💾 حفظ", callback_data="mtproto_save")],
+                [InlineKeyboardButton("❌ إلغاء", callback_data="mtproto_cancel")],
+            ]),
+        )
         return
 
     if awaiting == "new_github_token":
@@ -4368,6 +4519,63 @@ async def _handle_callback(query, context, uid, data, st):
     elif data == "ksnew_standalone":
         st["await"] = "new_ks_name_standalone"
         await query.edit_message_text("✍️ اكتب اسم لهذا التوقيع الجديد:")
+
+    # ── تفعيل تحميل الملفات الكبيرة (MTProto عن طريق Telethon) ──
+    elif data == "menu_update_mtproto":
+        if not TELETHON_AVAILABLE:
+            await query.edit_message_text(
+                "❌ مكتبة Telethon مش متثبتة على السيرفر.\n"
+                "لازم تضيف `telethon` في requirements.txt وتعيد نشر البوت الأول.",
+                reply_markup=None,
+            )
+        else:
+            has_id   = bool(CFG.get("mtproto_api_id"))
+            has_hash = bool(CFG.get("mtproto_api_hash"))
+            status = "✅ مفعّل حاليًا" if (has_id and has_hash) else "❌ غير مفعّل"
+            st["await"] = "new_mtproto_api_id"
+            await query.edit_message_text(
+                "📡 تفعيل تحميل الملفات الكبيرة (لحد 2 جيجابايت)\n\n"
+                f"الحالة الحالية: {status}\n\n"
+                "الخطوة 1/2: روح على https://my.telegram.org/apps وسجّل دخول "
+                "بحسابك على تيليجرام، واعمل تطبيق جديد لو معندكش، وهيديك "
+                "API_ID و API_HASH.\n\n"
+                "ابعتلي الـ API_ID دلوقتي (رقم فقط):"
+            )
+
+    elif data == "mtproto_save":
+        api_id   = str(st.get("tmp_mtproto_api_id") or "").strip()
+        api_hash = str(st.get("tmp_mtproto_api_hash") or "").strip()
+        st.pop("tmp_mtproto_api_id", None)
+        st.pop("tmp_mtproto_api_hash", None)
+        if not api_id or not api_hash:
+            await query.edit_message_text("❌ حصل خطأ، القيم مش موجودة. جرب تاني من القائمة.", reply_markup=None)
+        else:
+            try:
+                if os.path.exists(CONFIG_PATH):
+                    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                        existing = json.load(f)
+                else:
+                    existing = dict(DEFAULT_CONFIG)
+            except Exception:
+                existing = dict(DEFAULT_CONFIG)
+            existing["mtproto_api_id"]   = api_id
+            existing["mtproto_api_hash"] = api_hash
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(existing, f, ensure_ascii=False, indent=2)
+            CFG["mtproto_api_id"]   = api_id
+            CFG["mtproto_api_hash"] = api_hash
+            await reset_telethon_client()
+            await query.edit_message_text(
+                "✅ تم حفظ بيانات MTProto بنجاح.\n"
+                "دلوقتي أي ملف تبعته أكبر من 20MB (لحد 2 جيجابايت) هينزل تلقائي "
+                "عن طريق الاتصال المباشر بدل الـ Bot API العادي.",
+                reply_markup=None,
+            )
+
+    elif data == "mtproto_cancel":
+        st.pop("tmp_mtproto_api_id", None)
+        st.pop("tmp_mtproto_api_hash", None)
+        await query.edit_message_text("❌ اتلغى، البيانات مبتحفظتش.", reply_markup=None)
 
     # ── تحديث توكن GitHub ──
     elif data == "menu_update_github_token":
