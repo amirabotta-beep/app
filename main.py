@@ -1935,23 +1935,13 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.delete()
             return
 
-        if os.path.isdir(PROJECT_DIR):
-            shutil.rmtree(PROJECT_DIR, ignore_errors=True)
-
-        await msg.edit_text("⏳ جاري فك الـ APK (baksmali - أكواد فقط)...")
-        apk_size = os.path.getsize(APK_COPY_PATH)
-        ok, log_text, elapsed = await run_async_with_heartbeat(
-            decompile_apk_fast(APK_COPY_PATH, PROJECT_DIR),
-            msg, "⏳ جاري فك الـ APK (baksmali - أكواد فقط)...",
+        await msg.edit_text(
+            "✅ اتحمّل الملف بنجاح.\n\nعايز تعمل إيه دلوقتي؟",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔧 فكه (بحث واستبدال / تعديل)", callback_data="apkupload_decompile")],
+                [InlineKeyboardButton("🖊 توقيعه بس (من غير تعديل)",    callback_data="apkupload_sign")],
+            ]),
         )
-        if ok:
-            record_stage_time("decompile", apk_size, elapsed)
-
-        if ok:
-            await msg.edit_text(f"✅ تم فك الـ APK بنجاح في {format_duration(elapsed)}.\n" + tail_log(log_text))
-            await update.message.reply_text("📋 القائمة الرئيسية:", reply_markup=main_menu_kb())
-        else:
-            await msg.edit_text("❌ فشلت عملية الفك:\n" + tail_log(log_text, 1500), reply_markup=None)
         return
 
     await update.message.reply_text(
@@ -2670,6 +2660,34 @@ def project_integrity_report_text(problems):
         + "\n\n💡 لو انت عدّلت أو مسحت حاجة يدوي جوه مجلد المشروع، رجّعها زي ما كانت.\n"
           "أو ابعت ملف الـ APK الأصلي تاني وخليه يتفك من جديد."
     )
+
+
+async def decompile_uploaded_apk(query, uid, then_sign: bool):
+    """بتفك آخر APK اتحمّل (APK_COPY_PATH)، وبعد النجاح إما تورّي القائمة
+    الرئيسية عادي (then_sign=False)، أو تروح على طول لقائمة اختيار طريقة
+    التوقيع (then_sign=True) — عشان المستخدم يقدر يوقّع من غير ما يعدّل حاجة."""
+    if os.path.isdir(PROJECT_DIR):
+        shutil.rmtree(PROJECT_DIR, ignore_errors=True)
+
+    msg = query.message
+    await query.edit_message_text("⏳ جاري فك الـ APK (baksmali - أكواد فقط)...")
+    apk_size = os.path.getsize(APK_COPY_PATH)
+    ok, log_text, elapsed = await run_async_with_heartbeat(
+        decompile_apk_fast(APK_COPY_PATH, PROJECT_DIR),
+        msg, "⏳ جاري فك الـ APK (baksmali - أكواد فقط)...",
+    )
+    if ok:
+        record_stage_time("decompile", apk_size, elapsed)
+
+    if not ok:
+        await msg.edit_text("❌ فشلت عملية الفك:\n" + tail_log(log_text, 1500), reply_markup=None)
+        return
+
+    await msg.edit_text(f"✅ تم فك الـ APK بنجاح في {format_duration(elapsed)}.\n" + tail_log(log_text))
+    if then_sign:
+        await start_build_flow(query, uid)
+    else:
+        await msg.reply_text("📋 القائمة الرئيسية:", reply_markup=main_menu_kb())
 
 
 async def start_build_flow(query, uid):
@@ -4361,6 +4379,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     HEAVY_ACTIONS = {
         "dl_decompile", "sign_random", "menu_build",
         "confirm_delete", "confirm_replace", "confirm_insert",
+        "apkupload_decompile", "apkupload_sign",
     }
     is_heavy = data in HEAVY_ACTIONS or data.startswith("ksbuild:")
     if is_heavy and st.get("busy"):
@@ -4403,6 +4422,10 @@ async def _handle_callback(query, context, uid, data, st):
     # ── بناء وتوقيع ──
     elif data == "menu_build":
         await start_build_flow(query, uid)
+    elif data == "apkupload_decompile":
+        await decompile_uploaded_apk(query, uid, then_sign=False)
+    elif data == "apkupload_sign":
+        await decompile_uploaded_apk(query, uid, then_sign=True)
     elif data == "sign_random":
         status_msg = await query.edit_message_text("⏳ جاري التجميع والتوقيع...")
         await do_build_and_sign(context, query.message.chat_id, status_msg, uid, mode="random")
