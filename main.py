@@ -1589,8 +1589,7 @@ async def get_telethon_client():
             return _TELETHON_CLIENT
 
         try:
-            session_path = os.path.join(WORKSPACE_DIR, "mtproto_session")
-            client = TelegramClient(session_path, int(api_id), api_hash)
+            client = TelegramClient(StringSession(), int(api_id), api_hash)
             await client.start(bot_token=bot_token)
             _TELETHON_CLIENT = client
             return client
